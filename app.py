@@ -171,7 +171,7 @@ FOOD_TYPES = [
 ]
 
 OLD_ALLERGENS = [
-    "🟩 해당없음 (안전)", "난류(가금류)", "우유", "메밀", "땅콩", "대두", "밀", "고등어", "게", "새우",
+    "🟩 해당없음 (안전)", "난류(가금류)", "우유", "메밀", "땅콩", "대두", "밀", "고등어", "게", "새우", 
     "돼지고기", "복숭아", "토마토", "아황산류", "호두", "닭고기", "쇠고기", "오징어", "조개류(굴, 전복, 홍합 포함)", "잣"
 ]
 
@@ -203,8 +203,8 @@ def upload_file_to_drive(file_bytes, file_name, mime_type):
         file_metadata = {'name': file_name, 'parents': [FOLDER_ID]}
         media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
         uploaded_file = service.files().create(
-            body=file_metadata,
-            media_body=media,
+            body=file_metadata, 
+            media_body=media, 
             fields='id, webViewLink'
         ).execute()
         return uploaded_file.get('webViewLink'), uploaded_file.get('id')
@@ -222,7 +222,7 @@ def download_file_from_drive(file_id):
         done = False
         while done is False:
             status, done = downloader.next_chunk()
-
+        
         file_metadata = service.files().get(fileId=file_id, fields='mimeType').execute()
         return file_stream.getvalue(), file_metadata.get('mimeType')
     except Exception as e:
@@ -245,14 +245,14 @@ def update_row_data(row_index_str, update_dict):
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.sheet1
-
+        
         # A~N열 구글 시트 순서 매핑
         col_map = {
             '코드': 'A', '제품명': 'B', '식품유형': 'C', '원재료명(한글표시사항)': 'D',
             '원산지': 'E', '제조원': 'F', '공급사(판매원)': 'G', '기존알레르기': 'H',
             '신규알레르기': 'I', '검증상태': 'M', '검증결과': 'N'
         }
-
+        
         for key, val in update_dict.items():
             if key in col_map:
                 worksheet.update_acell(f'{col_map[key]}{row_index_str}', str(val))
@@ -288,105 +288,14 @@ def load_master_data():
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.worksheet("전체 원재료 명단")
-        df_m = pd.DataFrame(worksheet.get_all_records())
-        # 시트 헤더 호환성 보장 (품목코드/품목명/거래처명 표준화)
-        if not df_m.empty:
-            df_m.columns = [str(c).strip() for c in df_m.columns]
-            if '원자재코드' in df_m.columns and '품목코드' not in df_m.columns:
-                df_m['품목코드'] = df_m['원자재코드']
-            if '원자재명' in df_m.columns and '품목명' not in df_m.columns:
-                df_m['품목명'] = df_m['원자재명']
-            if '거래처명' not in df_m.columns:
-                df_m['거래처명'] = ""
-        return df_m
+        return pd.DataFrame(worksheet.get_all_records())
     except Exception:
         return pd.DataFrame()
 
 # ==========================================
-# 3. 공용 헬퍼 함수 (상호 정규화 & 마스터 매칭)
+# 3. 공용 헬퍼 함수
 # ==========================================
-def normalize_company_name(name, strip_parens=True):
-    """법인 기호, 불필요 수식어, 공백, 괄호 부가정보를 제거하여 핵심 상호명을 추출합니다."""
-    if pd.isna(name):
-        return ""
-    s = str(name).strip()
-    s = re.sub(r'^(공급사|판매원|제조원|납품업체)\s*[:：]\s*', '', s)
-    s = s.replace("㈜", "").replace("(주)", "").replace("（주）", "")
-    s = s.replace("주식회사", "").replace("유한회사", "").replace("(유)", "").replace("합자회사", "").replace("(합)", "")
-    if strip_parens:
-        s = re.sub(r'\([^)]*\)', '', s)
-        s = re.sub(r'\[[^\]]*\]', '', s)
-    s = re.sub(r'[^가-힣a-zA-Z0-9]', '', s).lower()
-    return s
-
-def is_same_company(vendor_input, master_vendor):
-    """업체 입력 공급사명과 마스터 거래처명의 일치 여부를 판별합니다."""
-    v_core = normalize_company_name(vendor_input, strip_parens=True)
-    m_core = normalize_company_name(master_vendor, strip_parens=True)
-    v_full = normalize_company_name(vendor_input, strip_parens=False)
-    m_full = normalize_company_name(master_vendor, strip_parens=False)
-
-    for a, b in [(v_core, m_core), (v_full, m_full), (v_core, m_full), (v_full, m_core)]:
-        if a and b:
-            if a == b:
-                return True
-            if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
-                return True
-    return False
-
-def calc_name_similarity(a, b):
-    """제품명과 마스터 품목명 간의 글자 2-gram 유사도를 계산합니다."""
-    s1 = re.sub(r'[^가-힣a-zA-Z0-9]', '', str(a)).lower()
-    s2 = re.sub(r'[^가-힣a-zA-Z0-9]', '', str(b)).lower()
-    if not s1 or not s2:
-        return 0.0
-    if s1 == s2:
-        return 1.0
-    score_bonus = 0.4 if (s1 in s2 or s2 in s1) else 0.0
-    g1 = {s1[i:i+2] for i in range(max(1, len(s1) - 1))}
-    g2 = {s2[i:i+2] for i in range(max(1, len(s2) - 1))}
-    overlap = len(g1 & g2) / max(1, len(g1 | g2))
-    return min(1.0, overlap + score_bonus)
-
-def filter_master_candidates(master_df, vendor_name, product_name):
-    """전체 원재료 명단에서 1순위(동일 공급사 납품 품목) 및 2순위(품목명 유사 품목) 후보군을 압축 추출합니다."""
-    if master_df.empty or '품목코드' not in master_df.columns:
-        return {"공급사_일치_품목": [], "품목명_유사_참고후보": []}, pd.DataFrame()
-
-    work_df = master_df[['품목코드', '품목명', '거래처명']].copy()
-    work_df['품목코드'] = work_df['품목코드'].astype(str).str.strip()
-    work_df = work_df[work_df['품목코드'] != '']
-
-    # 1차: 공급사(판매원) ↔ 거래처명 매칭
-    vendor_mask = work_df['거래처명'].apply(lambda mv: is_same_company(vendor_name, mv))
-    vendor_matched_df = work_df[vendor_mask].drop_duplicates()
-
-    # 2차: 품목명 유사도 상위 후보 추출 (공급사 오기재 대비용)
-    work_df['_sim'] = work_df['품목명'].apply(lambda mp: calc_name_similarity(product_name, mp))
-    sim_Limit = 15 if not vendor_matched_df.empty else 40
-    similar_df = work_df[~vendor_mask].sort_values(by='_sim', ascending=False).head(sim_Limit)
-    similar_df = similar_df[similar_df['_sim'] > 0][['품목코드', '품목명', '거래처명']].drop_duplicates()
-
-    payload = {
-        "공급사_일치_품목": vendor_matched_df.to_dict(orient='records'),
-        "품목명_유사_참고후보": similar_df.to_dict(orient='records')
-    }
-    return payload, vendor_matched_df
-
-def extract_recommended_code(ai_text):
-    """AI 응답 텍스트에서 추천매칭코드 값만 정제하여 반환합니다."""
-    for line in str(ai_text).split('\n'):
-        if "추천매칭코드" in line and ":" in line:
-            raw = line.split(":", 1)[1].strip()
-            raw = re.sub(r'[\[\]\(\)\'\"`]', '', raw).strip()
-            if not raw or "없음" in raw:
-                return "없음"
-            code_token = raw.split()[0].strip()
-            return code_token
-    return "없음"
-
-def verify_with_ai(file_bytes, mime_type, vendor_data, candidates_payload):
-    candidates_json = json.dumps(candidates_payload, ensure_ascii=False)
+def verify_with_ai(file_bytes, mime_type, vendor_data, master_data_json):
     prompt = f"""
     당신은 식품안전팀의 엄격한 품질관리(QC) AI 검수자입니다.
     두 가지 작업을 수행하십시오.
@@ -394,19 +303,16 @@ def verify_with_ai(file_bytes, mime_type, vendor_data, candidates_payload):
     [작업 1: 교차 검증]
     업체가 입력한 데이터와 첨부된 라벨 문서(이미지/PDF)를 정밀하게 비교하세요.
     - 업체 데이터: 제품명({vendor_data['제품명']}), 공급사(판매원)({vendor_data.get('공급사(판매원)', '')}), 제조원({vendor_data['제조원']}), 원재료명({vendor_data['원재료명(한글표시사항)']}), 기존알레르기({vendor_data['기존알레르기']}), 신규알레르기({vendor_data['신규알레르기']})
-    - 라벨 원본에 숨어있는 알레르기 성분(특히 신규 알레르기: 참깨, 들깨, 아몬드, 캐슈넛 — 흑임자는 참깨, 임자/수임은 들깨로 분류) 누락 여부를 집중 점검하세요.
+    - 라벨 원본에 숨어있는 알레르기 성분(특히 신규 알레르기: 참깨, 들깨, 아몬드, 캐슈넛) 누락 여부를 집중 점검하세요.
 
-    [작업 2: 사내 원자재 마스터 품목코드 자동 매칭]
-    아래 제공된 '사내 원자재 후보 명단(JSON)'에서 업체가 제출한 [공급사(판매원): {vendor_data.get('공급사(판매원)', '')}] 및 [제품명: {vendor_data['제품명']}]과 일치하는 품목을 찾아 `품목코드`를 매칭하세요.
-    - 1순위 원칙: `공급사_일치_품목` 리스트(해당 거래처가 당사에 납품하는 품목 목록) 안에서 제품명·원재료 성분·이명(예: 구연산삼나트륨=구연산나트륨, 한주 본소금/중국산 정제염=정제염, 사내 괄호 구분자 제외 명칭 등)이 일치하는 품목코드를 최우선 선택하세요.
-    - 2순위 원칙: `공급사_일치_품목`이 비어 있거나 일치 품목이 전혀 없을 때만 `품목명_유사_참고후보`에서 제조원·제품명이 확실히 일치하는 코드를 선택하세요.
-    - 사내 원자재 후보 명단(JSON): {candidates_json}
+    [작업 2: 마스터 코드 매칭]
+    아래 제공된 '사내 전체 원자재 명단'을 바탕으로, 업체가 제출한 [제품명({vendor_data['제품명']})], [공급사(판매원)({vendor_data.get('공급사(판매원)', '')})], [제조원({vendor_data['제조원']})]과 텍스트 유사도(띄어쓰기, 축약어, 공장명 포함)가 가장 높은 원자재 코드를 하나 찾아 추천하세요.
+    - 사내 원자재 명단(JSON): {master_data_json}
 
     [출력 형식] (반드시 아래 양식을 지켜 순수 텍스트로만 출력하세요)
     판정: [합격] 또는 [불합격] (사유: ~)
-    상세코멘트: (라벨 대조 및 알레르기 검증 결과 상세 작성)
-    매칭근거: (선택한 사내 품목명·거래처명 및 매칭 판단 근거 요약)
-    추천매칭코드: (찾아낸 품목코드만 정확히 기재. 명단에 없거나 불확실하면 '없음'으로 기재)
+    상세코멘트: (검증 결과 상세 작성)
+    추천매칭코드: (찾아낸 원자재코드 숫자만 적으세요. 명단에 없거나 불확실하면 '없음'으로 기재)
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -447,7 +353,7 @@ def highlight_new_allergens(text):
     text = str(text)
     targets = ["참깨", "들깨", "아몬드", "캐슈넛"]
     has_target = any(t in text for t in targets)
-
+    
     if has_target:
         return f'<span style="background-color: #ffcccc; color: #cc0000; padding: 2px 6px; border-radius: 4px; font-weight: bold;">{text}</span>'
     return text
@@ -458,7 +364,7 @@ def highlight_new_allergens(text):
 with st.sidebar:
     st.markdown("### 🔐 식품안전팀 관리자 로그인")
     user_pw = st.text_input("접속 암호를 입력하세요:", type="password")
-
+    
 is_admin = (user_pw == ADMIN_PASSWORD)
 
 if not is_admin:
@@ -466,7 +372,7 @@ if not is_admin:
     # [프론트엔드] 협력업체 다중 등록 폼
     # ----------------------------------------------------
     st.title("🤝 원자재 라벨 및 표시사항 다중 등록 시스템")
-
+    
     st.markdown("""
     <div style="background-color: #f0f7ff; padding: 15px; border-radius: 8px; border-left: 5px solid #0056b3; margin-bottom: 20px;">
     <strong>📢 [안내] 원자재 알레르기 유발물질 선제적 전수조사 및 DB화</strong><br>
@@ -474,10 +380,10 @@ if not is_admin:
     연세유업은 제도 시행 전 <strong>선제적인 파악 및 대응</strong>을 통해 완벽한 법규 준수와 소비자 안전을 확보하고자, 협력업체에서 납품하시는 모든 원료의 <strong>'원본 라벨(한글표시사항)' 및 '성분 정보'</strong>를 전수조사 중입니다. 정확한 품질관리를 위해 사업자등록증 상의 정보와 라벨 원본 내용을 똑같이 기재해 주시기를 당부드립니다.
     </div>
     """, unsafe_allow_html=True)
-
+    
     if "item_count" not in st.session_state:
         st.session_state.item_count = 1
-
+        
     st.markdown("### 📝 제출 품목 개수 설정")
     col_num1, col_num2, col_num3 = st.columns([3, 2, 5])
     with col_num1:
@@ -487,24 +393,24 @@ if not is_admin:
         if st.button("입력칸 개수 적용 / 추가하기", type="secondary"):
             st.session_state.item_count = new_count
             st.rerun()
-
+            
     st.markdown("<hr style='border:2px solid #ddd'>", unsafe_allow_html=True)
-
+    
     if "vendor_maker" not in st.session_state:
         st.session_state.vendor_maker = ""
     if "vendor_items" not in st.session_state:
         st.session_state.vendor_items = [{} for _ in range(100)]
-
+        
     def save_maker():
         st.session_state.vendor_maker = st.session_state.maker_input
     def save_item(idx, key, val):
         st.session_state.vendor_items[idx][key] = val
-
+        
     def reset_form():
         st.session_state.vendor_maker = ""
         st.session_state.vendor_items = [{} for _ in range(100)]
         st.session_state.item_count = 1
-
+        
     st.markdown("### 🏢 공급사(판매원) 정보")
     st.caption("💡 연세유업에 원료를 직접 공급하시는 공급사(판매원)명을 사업자등록증 기준으로 기재해 주세요.")
     v_vendor_global = st.text_input(
@@ -514,37 +420,37 @@ if not is_admin:
         on_change=save_maker
     )
     st.markdown("---")
-
+    
     items_data = []
-
+    
     for i in range(int(st.session_state.item_count)):
         st.markdown(f"#### 📌 제출 품목 {i+1}")
-
+        
         current_data = st.session_state.vendor_items[i]
-
-        # 1열: 제품명 및 식품유형
+        
+        # 1열: 제품명 및 식품유형 (원산지 입력칸 제거 유지)
         col1, col2 = st.columns(2)
         with col1:
             v_name = st.text_input(
-                "🏷️ 제품명 (라벨 표기 기준, 필수)",
-                value=current_data.get('name', ''),
+                "🏷️ 제품명 (라벨 표기 기준, 필수)", 
+                value=current_data.get('name', ''), 
                 key=f"name_{i}"
             )
             save_item(i, 'name', v_name)
-
+            
         with col2:
             default_type_idx = 0
             if current_data.get('type') in FOOD_TYPES:
                 default_type_idx = FOOD_TYPES.index(current_data['type'])
-
+                
             v_type = st.selectbox(
-                "분류 식품유형 (타이핑하여 검색 가능, 필수)",
-                options=FOOD_TYPES,
+                "분류 식품유형 (타이핑하여 검색 가능, 필수)", 
+                options=FOOD_TYPES, 
                 index=default_type_idx,
                 key=f"type_{i}"
             )
             save_item(i, 'type', v_type)
-
+            
         # 2열: 품목별 제조원 및 '공급사(판매원)와 동일' 체크박스 + 우측 설명란
         col_m1, col_m2 = st.columns([2, 2])
         with col_m1:
@@ -554,7 +460,7 @@ if not is_admin:
                 key=f"same_maker_{i}"
             )
             save_item(i, 'same_maker', same_as_vendor)
-
+            
             if same_as_vendor:
                 v_item_maker = v_vendor_global
                 st.text_input(
@@ -571,7 +477,7 @@ if not is_admin:
                     key=f"item_maker_{i}"
                 )
             save_item(i, 'item_maker', v_item_maker)
-
+            
         with col_m2:
             st.markdown(
                 """
@@ -583,50 +489,50 @@ if not is_admin:
                 """,
                 unsafe_allow_html=True
             )
-
+            
         # 백엔드 전송 및 DB 호환을 위해 원산지 값은 빈칸으로 유지
         v_origin = ""
-
+            
         # 3열: 기존/신규 알레르기 및 원재료명
         col4, col5 = st.columns([2, 2])
         with col4:
             v_old_allergy = st.multiselect(
-                "⚠️ 기존 알레르기 물질 (필수 체크)",
+                "⚠️ 기존 알레르기 물질 (필수 체크)", 
                 options=OLD_ALLERGENS,
                 default=current_data.get('old_allergy', []),
                 key=f"oa_{i}"
             )
             save_item(i, 'old_allergy', v_old_allergy)
-
+            
             v_new_allergy = st.multiselect(
-                "🚨 신규 알레르기 물질 (필수 체크)",
+                "🚨 신규 알레르기 물질 (필수 체크)", 
                 options=NEW_ALLERGENS,
                 default=current_data.get('new_allergy', []),
                 key=f"na_{i}"
             )
             save_item(i, 'new_allergy', v_new_allergy)
-
+            
         with col5:
             v_ingredients = st.text_area(
-                "📝 원재료명 및 함량 (쉼표로 구분하여 전부 기재)",
+                "📝 원재료명 및 함량 (쉼표로 구분하여 전부 기재)", 
                 value=current_data.get('ingredients', ''),
-                height=120,
+                height=120, 
                 key=f"ing_{i}"
             )
             save_item(i, 'ingredients', v_ingredients)
-
+        
         uploaded_file = st.file_uploader("📸 원본 라벨 첨부 (PDF/JPG 필수)", type=['jpg', 'jpeg', 'png', 'pdf'], key=f"file_{i}")
-
+        
         items_data.append({
             "name": v_name, "type": v_type, "vendor": v_vendor_global, "maker": v_item_maker, "origin": v_origin,
             "old_allergy": v_old_allergy, "new_allergy": v_new_allergy,
             "ingredients": v_ingredients, "file": uploaded_file
         })
-
+        
         st.markdown("<hr style='border:1px dashed #ccc'>", unsafe_allow_html=True)
-
+        
     st.info("💡 모든 입력칸은 작성 즉시 자동 임시저장됩니다. 중간에 화면을 이동해도 내용이 유지됩니다.")
-
+    
     col_submit, col_reset = st.columns([8, 2])
     with col_submit:
         submit_btn = st.button("📤 작성한 품목 모두 제출하기", type="primary", use_container_width=True)
@@ -634,60 +540,60 @@ if not is_admin:
         if st.button("🗑️ 전체 비우기", use_container_width=True):
             reset_form()
             st.rerun()
-
+            
     if submit_btn:
         error_found = False
-
+        
         if not v_vendor_global:
             st.error("❌ 상단에 [공급사(판매원)]을 반드시 입력해 주세요.")
             error_found = True
-
+        
         for idx, item in enumerate(items_data):
             if not item['name'] or item['type'] == "선택하세요 (검색 가능)" or not item['maker'] or not item['ingredients'] or not item['file']:
                 st.error(f"❌ [품목 {idx+1}] 필수 항목(제품명, 식품유형, 제조원, 원재료명, 파일 첨부)이 누락되었습니다.")
                 error_found = True
-
+            
             if not item['old_allergy']:
                 st.error(f"❌ [품목 {idx+1}] 기존 알레르기 포함 여부를 체크해 주세요. (없으면 '해당없음')")
                 error_found = True
             elif "🟩 해당없음 (안전)" in item['old_allergy'] and len(item['old_allergy']) > 1:
                 st.error(f"❌ [품목 {idx+1}] 기존 알레르기에서 '해당없음'과 다른 물질을 중복 선택할 수 없습니다.")
                 error_found = True
-
+                
             if not item['new_allergy']:
                 st.error(f"❌ [품목 {idx+1}] 신규 알레르기 포함 여부를 체크해 주세요. (없으면 '해당없음')")
                 error_found = True
             elif "🟩 해당없음 (안전)" in item['new_allergy'] and len(item['new_allergy']) > 1:
                 st.error(f"❌ [품목 {idx+1}] 신규 알레르기에서 '해당없음'과 다른 물질을 중복 선택할 수 없습니다.")
                 error_found = True
-
+                
         if not error_found:
             progress_bar = st.progress(0)
             status_text = st.empty()
-
+            
             success_count = 0
             current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             total = len(items_data)
-
+            
             for idx, item in enumerate(items_data):
                 progress_pct = int(((idx) / total) * 100)
                 progress_bar.progress(progress_pct / 100.0)
                 status_text.info(f"총 {total}건 중 {idx+1}번째 품목({item['name']}) 라벨을 안전하게 전송 중입니다... ({progress_pct}%)")
-
+                
                 file_bytes = item['file'].getvalue()
                 file_mime_type = item['file'].type
                 ext = ".pdf" if "pdf" in file_mime_type.lower() else ".jpg"
                 file_name = f"업체제출_{item['name']}_{current_time}_{idx+1}{ext}"
-
+                
                 drive_link, file_id = upload_file_to_drive(file_bytes, file_name, file_mime_type)
-
+                
                 if drive_link and file_id:
                     # 구글 시트 열 순서(A~N열):
                     # A:코드, B:제품명, C:식품유형, D:원재료명(한글표시사항), E:원산지, F:제조원, G:공급사(판매원),
                     # H:기존알레르기, I:신규알레르기, J:제출일시, K:이미지링크, L:파일ID, M:검증상태, N:검증결과
                     row_data = [
-                        "", item['name'], item['type'], item['ingredients'], item['origin'], item['maker'],
-                        item['vendor'], ", ".join(item['old_allergy']), ", ".join(item['new_allergy']), current_time,
+                        "", item['name'], item['type'], item['ingredients'], item['origin'], item['maker'], 
+                        item['vendor'], ", ".join(item['old_allergy']), ", ".join(item['new_allergy']), current_time, 
                         drive_link, file_id, "대기중", "검증전"
                     ]
                     res = append_data_to_sheet(row_data)
@@ -697,16 +603,17 @@ if not is_admin:
                         st.error(f"[품목 {idx+1}] 저장 중 에러가 발생했습니다: {res}")
                 else:
                     st.error(f"[품목 {idx+1}] 파일 업로드에 실패했습니다.")
-
+            
             progress_bar.progress(1.0)
             status_text.success("전송 완료!")
-
+            
             if success_count == total:
                 st.success(f"🎉 총 {success_count}건의 품목 전체가 성공적으로 제출되었습니다! 협조해 주셔서 감사합니다.")
-                reset_form()
+                reset_form() 
                 st.balloons()
             elif success_count > 0:
                 st.warning(f"일부 품목만 제출되었습니다. ({success_count}/{total}건 성공)")
+
 else:
     # ----------------------------------------------------
     # [백엔드] 식품안전팀 관리자 대시보드
@@ -719,6 +626,7 @@ else:
     
     df = load_sheet_data()
     master_df = load_master_data()
+    master_json = master_df.to_json(orient='records', force_ascii=False) if not master_df.empty else "[]"
     
     # ------------------ [탭 1: 수취 현황판] ------------------
     with admin_tab1:
@@ -727,92 +635,33 @@ else:
             st.cache_data.clear()
             st.rerun()
             
-        if not master_df.empty and '품목코드' in master_df.columns:
-            master_view = master_df.copy()
-            master_view['품목코드'] = master_view['품목코드'].astype(str).str.strip()
-            master_view = master_view[master_view['품목코드'] != ''].reset_index(drop=True)
+        if not master_df.empty and not df.empty and '코드' in df.columns:
+            total_items = len(master_df)
+            submitted_codes = df[df['코드'] != '']['코드'].astype(str).tolist()
+            master_df['제출여부'] = master_df['원자재코드'].astype(str).isin(submitted_codes)
             
-            total_items = len(master_view)
-            pending_count = 0
-            approved_rows = pd.DataFrame()
+            submitted_count = master_df['제출여부'].sum()
+            progress_pct = int((submitted_count / total_items) * 100) if total_items > 0 else 0
             
-            if not df.empty:
-                if '검증상태' in df.columns:
-                    pending_count = int((df['검증상태'].astype(str).str.strip() == '대기중').sum())
-                if '코드' in df.columns:
-                    approved_rows = df[df['코드'].astype(str).str.strip() != ''].copy()
-                    approved_rows['코드'] = approved_rows['코드'].astype(str).str.strip()
-            
-            # 동일 품목코드에 복수 거래처가 있는 원료와 단일 거래처 원료를 구분하여 매핑 여부 판별
-            code_counts = master_view['품목코드'].value_counts().to_dict()
-            
-            def check_master_submitted(m_row):
-                if approved_rows.empty:
-                    return False
-                m_code = str(m_row.get('품목코드', '')).strip()
-                m_vendor = str(m_row.get('거래처명', '')).strip()
-                code_matches = approved_rows[approved_rows['코드'] == m_code]
-                if code_matches.empty:
-                    return False
-                # 단일 거래처 품목코드는 코드 부여 시 바로 완료 처리
-                if code_counts.get(m_code, 1) == 1 or not m_vendor:
-                    return True
-                # 복수 거래처 품목코드는 공급사(판매원) 또는 제조원 상호까지 일치할 때 완료 처리
-                for _, a_row in code_matches.iterrows():
-                    sub_vendor = str(a_row.get('공급사(판매원)', ''))
-                    sub_maker = str(a_row.get('제조원', ''))
-                    if is_same_company(sub_vendor, m_vendor) or is_same_company(sub_maker, m_vendor):
-                        return True
-                return False
-            
-            master_view['제출여부'] = master_view.apply(check_master_submitted, axis=1)
-            
-            submitted_count = int(master_view['제출여부'].sum())
-            missing_count = total_items - submitted_count
-            progress_pct = round((submitted_count / total_items) * 100, 1) if total_items > 0 else 0.0
-            
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("전체 마스터 원료(거래처별)", f"{total_items}건")
-            kpi2.metric("승인(코드 부여) 완료", f"{submitted_count}건", f"{progress_pct}%")
-            kpi3.metric("미제출 / 미승인 잔여", f"{missing_count}건")
-            kpi4.metric("현재 검수 대기중(시트1)", f"{pending_count}건")
-            
-            st.progress(min(1.0, progress_pct / 100.0))
+            st.progress(progress_pct / 100.0)
             st.markdown(f"**전체 {total_items}건 중 {submitted_count}건 코드 맵핑 완료 (진행률: {progress_pct}%)**")
             
-            show_master_cols = [c for c in ['품목코드', '품목명', '거래처명'] if c in master_view.columns]
             col_m1, col_m2 = st.columns(2)
             with col_m1:
-                st.error(f"🔴 미제출/미승인 업체 리스트 ({missing_count}건)")
-                missing_df = master_view[master_view['제출여부'] == False]
-                st.dataframe(missing_df[show_master_cols], use_container_width=True, hide_index=True)
+                st.error(f"🔴 미제출/미승인 업체 리스트 ({total_items - submitted_count}건)")
+                missing_df = master_df[master_df['제출여부'] == False]
+                st.dataframe(missing_df[['원자재코드', '원자재명']], use_container_width=True, hide_index=True)
             with col_m2:
                 st.success(f"🟢 승인 완료 리스트 ({submitted_count}건)")
-                completed_df = master_view[master_view['제출여부'] == True]
-                st.dataframe(completed_df[show_master_cols], use_container_width=True, hide_index=True)
+                completed_df = master_df[master_df['제출여부'] == True]
+                st.dataframe(completed_df[['원자재코드', '원자재명']], use_container_width=True, hide_index=True)
         else:
-            st.info("구글 시트에 '전체 원재료 명단' 데이터가 없거나 헤더(품목코드, 품목명, 거래처명)를 확인해주세요.")
+            st.info("구글 시트에 '전체 원재료 명단' 또는 제출된 데이터가 없습니다.")
 
     # ------------------ [탭 2: AI 검증 및 승인] ------------------
     with admin_tab2:
         st.markdown("### 🤖 대기열 검증 및 마스터 코드 확정 (인라인 수정 모드)")
         st.caption("좌측의 폼에서 오타를 직접 수정한 후 승인할 수 있으며, 우측의 라벨 이미지와 실시간으로 대조 가능합니다.")
-        
-        # 마스터 명단 직접 검색용 옵션 목록 구성
-        master_select_options = ["직접 입력 / AI 추천값 유지"]
-        master_code_lookup = {}
-        if not master_df.empty and '품목코드' in master_df.columns:
-            for _, m_row in master_df.iterrows():
-                mc = str(m_row.get('품목코드', '')).strip()
-                mn = str(m_row.get('품목명', '')).strip()
-                mv = str(m_row.get('거래처명', '')).strip()
-                if mc:
-                    label_str = f"[{mc}] {mn} | {mv}"
-                    if label_str not in master_code_lookup:
-                        master_select_options.append(label_str)
-                        master_code_lookup[label_str] = mc
-                    if mc not in master_code_lookup:
-                        master_code_lookup[mc] = f"[{mc}] {mn} ({mv})"
         
         if not df.empty and '검증상태' in df.columns:
             pending_df = df[df['검증상태'] == '대기중'].reset_index()
@@ -825,12 +674,11 @@ else:
                 for _, row in pending_df.iterrows():
                     excel_row_idx = row['index'] + 2 
                     name = row.get('제품명', '')
-                    vendor_title = row.get('공급사(판매원)', '')
                     file_id = row.get('파일ID', '')
                     submit_time = row.get('제출일시', '')
                     img_url = row.get('이미지링크', '')
                     
-                    with st.expander(f"📦 [대기중] {name} | 공급사: {vendor_title} ({submit_time})", expanded=False):
+                    with st.expander(f"📦 [대기중] {name} - ({submit_time})", expanded=False):
                         col_left, col_right = st.columns([4, 6])
                         
                         with col_left:
@@ -846,16 +694,9 @@ else:
                             edit_new = st.text_input("신규 알레르기", value=row.get('신규알레르기', ''), key=f"e_new_{excel_row_idx}")
                             edit_ing = st.text_area("원재료명(한글표시사항)", value=row.get('원재료명(한글표시사항)', ''), height=150, key=f"e_ing_{excel_row_idx}")
                             
-                            # 공급사 기준 1차 후보군 실시간 조회
-                            candidates_payload, vendor_matched_df = filter_master_candidates(master_df, edit_vendor, edit_name)
-                            if not vendor_matched_df.empty:
-                                st.caption(f"✅ 사내 마스터 내 '{edit_vendor}' 일치 거래처 품목 {len(vendor_matched_df)}건 확인됨")
-                            else:
-                                st.caption("ℹ️ 공급사명 완전 일치 거래처 없음 (AI 분석 시 전체 명단 유사 품목으로 확장 탐색)")
-                            
                             if st.button(f"🔍 AI 교차검증 및 매칭 분석", key=f"btn_ai_{excel_row_idx}"):
                                 if file_id:
-                                    with st.spinner("드라이브 라벨 분석 및 공급사·제품명 기반 마스터 코드 매칭 중..."):
+                                    with st.spinner("드라이브 라벨 분석 및 마스터 코드 매칭 중..."):
                                         f_bytes, mime = download_file_from_drive(file_id)
                                         if f_bytes:
                                             updated_vendor_data = {
@@ -866,12 +707,16 @@ else:
                                                 '기존알레르기': edit_old,
                                                 '신규알레르기': edit_new
                                             }
-                                            result = verify_with_ai(f_bytes, mime, updated_vendor_data, candidates_payload)
-                                            match_code = extract_recommended_code(result)
+                                            result = verify_with_ai(f_bytes, mime, updated_vendor_data, master_json)
+                                            
+                                            match_code = "없음"
+                                            for line in result.split('\n'):
+                                                if "추천매칭코드:" in line:
+                                                    match_code = line.split("추천매칭코드:")[1].strip()
+                                                    break
                                             
                                             st.session_state[f"ai_result_{excel_row_idx}"] = result
                                             st.session_state[f"rec_code_{excel_row_idx}"] = match_code
-                                            st.session_state[f"final_code_{excel_row_idx}"] = match_code
                                         else:
                                             st.error("라벨 파일 다운로드 실패")
                                 else:
@@ -887,35 +732,17 @@ else:
                                     st.info(ai_result_text)
                                 
                                 st.markdown("---")
-                                
-                                # 마스터 명단 검색 드롭다운 (수동 변경 필요 시 선택 즉시 아래 코드 입력란에 반영)
-                                def apply_manual_select(row_idx=excel_row_idx):
-                                    sel_val = st.session_state.get(f"sel_master_{row_idx}", "")
-                                    if sel_val in master_code_lookup and sel_val != "직접 입력 / AI 추천값 유지":
-                                        st.session_state[f"final_code_{row_idx}"] = master_code_lookup[sel_val]
-                                
-                                st.selectbox(
-                                    "🔎 사내 마스터 명단에서 직접 검색·변경 (선택 시 아래 코드칸에 자동 입력):",
-                                    options=master_select_options,
-                                    key=f"sel_master_{excel_row_idx}",
-                                    on_change=apply_manual_select
-                                )
-                                
                                 final_code = st.text_input(
                                     "최종 매핑할 '원자재 코드' 입력:", 
-                                    value=st.session_state.get(f"rec_code_{excel_row_idx}", ""), 
+                                    value=st.session_state[f"rec_code_{excel_row_idx}"], 
                                     key=f"final_code_{excel_row_idx}"
                                 )
                                 
-                                clean_final_code = str(final_code).strip()
-                                if clean_final_code in master_code_lookup:
-                                    st.caption(f"📌 매핑 대상 확인: {master_code_lookup[clean_final_code]}")
-                                
-                                if st.button(f"✅ 코드 '{clean_final_code}' 승인 및 수정사항 전체 DB 저장", type="primary", key=f"btn_approve_{excel_row_idx}"):
-                                    if clean_final_code and clean_final_code != "없음":
+                                if st.button(f"✅ 코드 '{final_code}' 승인 및 수정사항 전체 DB 저장", type="primary", key=f"btn_approve_{excel_row_idx}"):
+                                    if final_code and final_code != "없음":
                                         ai_full_text = st.session_state[f"ai_result_{excel_row_idx}"]
                                         update_dict = {
-                                            '코드': clean_final_code,
+                                            '코드': final_code,
                                             '제품명': edit_name,
                                             '식품유형': edit_type,
                                             '원재료명(한글표시사항)': edit_ing,
