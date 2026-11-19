@@ -939,8 +939,9 @@ else:
                                         }
                                         res = update_row_data(excel_row_idx, update_dict)
 
-                                        if res == True:
-                                            st.success("데이터베이스에 코드 및 수정 내용이 정상 확정되었습니다! (새로고침 요망)")
+                                       if res == True:
+                                            st.cache_data.clear()
+                                            st.rerun()
                                         else:
                                             st.error(f"저장 에러: {res}")
                                     else:
