@@ -800,10 +800,17 @@ else:
         else:
             st.info("구글 시트에 '전체 원재료 명단' 데이터가 없거나 헤더(품목코드, 품목명, 거래처명)를 확인해주세요.")
 
-    # ------------------ [탭 2: AI 검증 및 승인] ------------------
+   # ------------------ [탭 2: AI 검증 및 승인] ------------------
     with admin_tab2:
-        st.markdown("### 🤖 대기열 검증 및 마스터 코드 확정 (인라인 수정 모드)")
-        st.caption("좌측의 폼에서 오타를 직접 수정한 후 승인할 수 있으며, 우측의 라벨 이미지와 실시간으로 대조 가능합니다.")
+        col_t2_title, col_t2_btn = st.columns([8, 2])
+        with col_t2_title:
+            st.markdown("### 🤖 대기열 검증 및 마스터 코드 확정 (인라인 수정 모드)")
+            st.caption("좌측의 폼에서 오타를 직접 수정한 후 승인할 수 있으며, 우측의 라벨 이미지와 실시간으로 대조 가능합니다.")
+        with col_t2_btn:
+            st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+            if st.button("🔄 대기 목록 새로고침", key="btn_refresh_tab2", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
         master_select_options = ["직접 입력 / AI 추천값 유지"]
         master_code_lookup = {}
