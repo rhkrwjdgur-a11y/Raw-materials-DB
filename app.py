@@ -939,7 +939,7 @@ else:
                                         }
                                         res = update_row_data(excel_row_idx, update_dict)
 
-                                       if res == True:
+                                        if res == True:
                                             st.cache_data.clear()
                                             st.rerun()
                                         else:
