@@ -729,12 +729,12 @@ else:
     df = load_sheet_data()
     master_df = standardize_master_columns(load_master_data())
 
-    # ------------------ [탭 1: 수취 현황판 (검증 무관 제출 건수 기준)] ------------------
+    # ------------------ [탭 1: 수취 현황판 (미제출 독촉 & 승인 관리 분리)] ------------------
     with admin_tab1:
         col_t1_title, col_t1_btn = st.columns([8, 2])
         with col_t1_title:
-            st.markdown("### 📈 협력업체 제출 수량 현황 및 독촉 대상 관제 (검증 여부 무관)")
-            st.caption("관리자 AI 검증·승인 전이라도 '시트1'에 접수된 전체 건수를 기준으로 미제출 및 수량 부족 업체를 실시간 집계합니다.")
+            st.markdown("### 📈 협력업체 라벨 제출 현황 및 승인 관제")
+            st.caption("① 아예 안 낸 업체 명단, ② 낸 업체 중 누락 품목(승인·미승인 무관), ③ 내부 승인/미승인 현황을 각각 분리하여 관리합니다.")
         with col_t1_btn:
             st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
             if st.button("🔄 최신 데이터 불러오기", key="t1_btn_refresh", use_container_width=True):
@@ -751,7 +751,7 @@ else:
 
             total_items = len(master_view)
 
-            # 시트1 전체 유효 제출 데이터 준비 (대기중·승인완료 구분 없이 모두 제출건으로 인정)
+            # 시트1 전체 제출 데이터 정리
             valid_sub_df = pd.DataFrame()
             if not df.empty:
                 valid_sub_df = df.copy()
@@ -764,8 +764,10 @@ else:
                     (valid_sub_df['제조원'].astype(str).str.strip() != '')
                 )
                 valid_sub_df = valid_sub_df[non_empty_mask].copy()
+                valid_sub_df['코드'] = valid_sub_df['코드'].astype(str).str.strip()
+                valid_sub_df['검증상태'] = valid_sub_df['검증상태'].astype(str).str.strip()
 
-            # 마스터 거래처별 메타 인덱스 구성
+            # 마스터 거래처별 인덱스 구성
             vendor_meta = {}
             for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
                 raw_v = grp['거래처명_원본'].iloc[0]
@@ -782,7 +784,7 @@ else:
                 code_to_vendors.setdefault(c_val, []).append(r['거래처_표시명'])
             code_to_vendors = {k: list(dict.fromkeys(v)) for k, v in code_to_vendors.items()}
 
-            # 시트1 각 제출 행을 마스터 거래처 1곳에 정확히 매핑 (중복 카운트 방지)
+            # 시트1 제출 행 -> 마스터 거래처 1곳 매핑
             def match_company_to_master_vendor(comp_str, prod_name, candidate_vendors=None):
                 v_full = normalize_company_name(comp_str, strip_parens=False)
                 v_core = normalize_company_name(comp_str, strip_parens=True)
@@ -853,236 +855,318 @@ else:
             else:
                 unmatched_sub_df = pd.DataFrame()
 
-            # 거래처 단위 수량 집계 (검증/승인 여부 무관)
-            vendor_summary_list = []
+            # 승인 전 대기중 품목의 제품명 <-> 마스터 품목명 대조 점수 함수
+            def normalize_item_text(t):
+                s = str(t).strip().lower()
+                s = s.replace("구연산삼나트륨", "구연산나트륨").replace("흑임자", "검은깨")
+                s = re.sub(r'[^가-힣a-z0-9]', '', s)
+                return s
+
+            def item_pair_score(sub_name, master_name, vendor_name=""):
+                sn = normalize_item_text(sub_name)
+                if not sn:
+                    return 0.0
+                candidates = [master_name]
+                outside = re.sub(r'\([^)]*\)', '', str(master_name)).strip()
+                if outside:
+                    candidates.append(outside)
+                v_norm = normalize_item_text(vendor_name)
+                for m in re.findall(r'\(([^)]+)\)', str(master_name)):
+                    mn = normalize_item_text(m)
+                    if mn and mn != v_norm and len(mn) >= 2:
+                        candidates.append(m)
+
+                best = 0.0
+                for cand in candidates:
+                    cn = normalize_item_text(cand)
+                    if not cn:
+                        continue
+                    if sn == cn:
+                        return 1.0
+                    sim = calc_name_similarity(sn, cn)
+                    if len(sn) >= 2 and len(cn) >= 2 and (sn in cn or cn in sn):
+                        sim = max(sim, 0.75)
+                    if sim > best:
+                        best = sim
+                return best
+
+            # 마스터 품목별 상태 판별: 승인여부(코드 확정) vs 제출여부_통합(승인+대기중 모두 포함)
+            master_view['승인여부'] = False
+            master_view['제출여부_통합'] = False
+            master_view['매칭된_제출제품명'] = ""
+            master_view['업체_미분류_대기건'] = ""
+
+            zero_vendor_list = []
+            submitted_vendor_names = set()
+
+            code_vendor_counts = master_view['품목코드'].value_counts().to_dict()
+            all_approved_codes = set()
+            if not valid_sub_df.empty:
+                all_approved_codes = set(valid_sub_df[valid_sub_df['코드'] != '']['코드'].tolist())
+
             for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
-                v_master_cnt = len(grp)
+                m_indices = grp.index.tolist()
                 if not valid_sub_df.empty:
-                    v_sub_rows = valid_sub_df[valid_sub_df['_매칭거래처'] == v_disp]
+                    v_subs = valid_sub_df[valid_sub_df['_매칭거래처'] == v_disp].copy()
                 else:
-                    v_sub_rows = pd.DataFrame()
+                    v_subs = pd.DataFrame()
 
-                v_sub_cnt = len(v_sub_rows)
-                v_short_cnt = max(0, v_master_cnt - v_sub_cnt)
+                # 단일 거래처 코드인데 코드 승인만 되어 있는 건 보완
+                approved_by_single_code_idx = set()
+                for idx in m_indices:
+                    mc = master_view.loc[idx, '품목코드']
+                    if code_vendor_counts.get(mc, 1) == 1 and mc in all_approved_codes:
+                        approved_by_single_code_idx.add(idx)
 
-                master_item_str = ", ".join(
-                    [f"[{r['품목코드']}] {r['품목명']}" for _, r in grp.iterrows()]
-                )
-                submitted_prod_str = (
-                    ", ".join(v_sub_rows['제품명'].astype(str).tolist()) if not v_sub_rows.empty else "-"
-                )
+                if v_subs.empty and not approved_by_single_code_idx:
+                    # 아예 1건도 안 낸 전면 미제출 업체
+                    biz_str = ""
+                    if has_biz_col:
+                        biz_vals = [str(x).strip() for x in grp['사업자번호'].unique() if str(x).strip()]
+                        biz_str = ", ".join(biz_vals)
+                    item_list_str = ", ".join([f"[{r['품목코드']}] {r['품목명']}" for _, r in grp.iterrows()])
+                    zero_vendor_list.append({
+                        '거래처명': v_disp,
+                        '사업자번호': biz_str,
+                        '미제출 품목수': len(grp),
+                        '마스터 등록 품목 목록': item_list_str
+                    })
+                    continue
 
-                if v_sub_cnt == 0:
-                    v_status = "전면 미제출"
-                elif v_sub_cnt < v_master_cnt:
-                    v_status = "일부 미제출(수량부족)"
-                else:
-                    v_status = "수량 충족"
+                submitted_vendor_names.add(v_disp)
 
-                biz_str = ""
-                if has_biz_col:
-                    biz_vals = [str(x).strip() for x in grp['사업자번호'].unique() if str(x).strip()]
-                    biz_str = ", ".join(biz_vals)
+                # 1단계: 코드 승인된 건 매칭
+                used_sub_indices = set()
+                matched_m_indices = set()
 
-                vendor_summary_list.append({
-                    '독촉구분': v_status,
-                    '거래처명': v_disp,
-                    '사업자번호': biz_str,
-                    '마스터 품목수': v_master_cnt,
-                    '현재 제출 건수': v_sub_cnt,
-                    '미제출(부족) 건수': v_short_cnt,
-                    '마스터 등록 품목 전체': master_item_str,
-                    '현재 제출된 제품명': submitted_prod_str
-                })
+                for idx in approved_by_single_code_idx:
+                    master_view.loc[idx, '승인여부'] = True
+                    master_view.loc[idx, '제출여부_통합'] = True
+                    matched_m_indices.add(idx)
 
-            vendor_summary_df = pd.DataFrame(vendor_summary_list)
-            total_vendors = len(vendor_summary_df)
-            zero_vendors_df = vendor_summary_df[vendor_summary_df['독촉구분'] == '전면 미제출'].copy()
-            short_vendors_df = vendor_summary_df[vendor_summary_df['독촉구분'] == '일부 미제출(수량부족)'].copy()
-            fulfilled_vendors_df = vendor_summary_df[vendor_summary_df['독촉구분'] == '수량 충족'].copy()
-            remind_all_df = vendor_summary_df[vendor_summary_df['독촉구분'] != '수량 충족'].copy()
+                if not v_subs.empty:
+                    coded_subs = v_subs[v_subs['코드'] != '']
+                    for s_idx, s_row in coded_subs.iterrows():
+                        sc = s_row['코드']
+                        for idx in m_indices:
+                            if master_view.loc[idx, '품목코드'] == sc:
+                                master_view.loc[idx, '승인여부'] = True
+                                master_view.loc[idx, '제출여부_통합'] = True
+                                master_view.loc[idx, '매칭된_제출제품명'] = str(s_row.get('제품명', ''))
+                                matched_m_indices.add(idx)
+                                used_sub_indices.add(s_idx)
 
-            total_sub_rows = len(valid_sub_df)
-            total_shortfall_cnt = int(vendor_summary_df['미제출(부족) 건수'].sum())
-            fulfilled_item_equiv = total_items - total_shortfall_cnt
-            submit_pct = round((fulfilled_item_equiv / total_items) * 100, 1) if total_items > 0 else 0.0
+                # 2단계: 승인 전(코드 빈칸) 대기중 제출건 매칭 (승인·미승인 구분 없이 제출 인정)
+                rem_m_indices = [idx for idx in m_indices if idx not in matched_m_indices]
+                rem_subs = v_subs[~v_subs.index.isin(used_sub_indices)] if not v_subs.empty else pd.DataFrame()
 
-            # 1단 KPI: 품목 수량 기준 (검증 무관)
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("전체 마스터 품목수", f"{total_items}건")
-            kpi2.metric("시트1 총 접수 건수 (검증 무관)", f"{total_sub_rows}건", f"수량충족률 {submit_pct}%")
-            kpi3.metric("미제출(부족) 잔여 수량", f"{total_shortfall_cnt}건")
-            kpi4.metric("상호 미매칭 제출건 (확인필요)", f"{len(unmatched_sub_df)}건")
+                if len(m_indices) == 1 and len(rem_m_indices) == 1 and not rem_subs.empty:
+                    only_idx = rem_m_indices[0]
+                    first_s_idx = rem_subs.index[0]
+                    master_view.loc[only_idx, '제출여부_통합'] = True
+                    master_view.loc[only_idx, '매칭된_제출제품명'] = str(rem_subs.loc[first_s_idx, '제품명'])
+                    matched_m_indices.add(only_idx)
+                    used_sub_indices.add(first_s_idx)
+                elif rem_m_indices and not rem_subs.empty:
+                    pair_candidates = []
+                    for idx in rem_m_indices:
+                        m_name = master_view.loc[idx, '품목명']
+                        for s_idx, s_row in rem_subs.iterrows():
+                            s_name = str(s_row.get('제품명', ''))
+                            sc_val = item_pair_score(s_name, m_name, v_disp)
+                            if sc_val >= 0.55:
+                                pair_candidates.append((sc_val, idx, s_idx, s_name))
+                    pair_candidates.sort(key=lambda x: x[0], reverse=True)
+                    for sc_val, idx, s_idx, s_name in pair_candidates:
+                        if idx not in matched_m_indices and s_idx not in used_sub_indices:
+                            master_view.loc[idx, '제출여부_통합'] = True
+                            master_view.loc[idx, '매칭된_제출제품명'] = s_name
+                            matched_m_indices.add(idx)
+                            used_sub_indices.add(s_idx)
 
-            st.progress(min(1.0, submit_pct / 100.0))
-            st.markdown(f"**전체 마스터 {total_items}건 대비 수량 기준 {fulfilled_item_equiv}건 접수 확인 / 잔여 부족 수량 {total_shortfall_cnt}건 (검증 전 대기건 모두 포함)**")
+                # 해당 업체에 제품명이 마스터와 전혀 달라 자동 연결 안 된 대기건이 남았다면 비고 표시
+                leftover_subs = v_subs[~v_subs.index.isin(used_sub_indices)] if not v_subs.empty else pd.DataFrame()
+                if not leftover_subs.empty:
+                    leftover_names = ", ".join(leftover_subs['제품명'].astype(str).tolist())
+                    for idx in m_indices:
+                        if not master_view.loc[idx, '제출여부_통합']:
+                            master_view.loc[idx, '업체_미분류_대기건'] = f"대기중 타명칭 제출있음: {leftover_names}"
 
-            # 2단 KPI: 거래처 기준 (독촉 메일 발송용)
-            vkpi1, vkpi2, vkpi3, vkpi4 = st.columns(4)
-            vkpi1.metric("전체 마스터 거래처", f"{total_vendors}개사")
-            vkpi2.metric("🔴 전면 미제출 업체 (0건)", f"{len(zero_vendors_df)}개사")
-            vkpi3.metric("🟡 일부 미제출 업체 (수량 부족)", f"{len(short_vendors_df)}개사")
-            vkpi4.metric("🟢 제출 수량 충족 업체", f"{len(fulfilled_vendors_df)}개사")
+            # 결과 데이터프레임 분리
+            zero_vendors_df = pd.DataFrame(zero_vendor_list)
 
-            if not remind_all_df.empty:
-                remind_cols = (
-                    ['독촉구분', '거래처명', '사업자번호', '마스터 품목수', '현재 제출 건수', '미제출(부족) 건수', '마스터 등록 품목 전체', '현재 제출된 제품명']
-                    if has_biz_col else
-                    ['독촉구분', '거래처명', '마스터 품목수', '현재 제출 건수', '미제출(부족) 건수', '마스터 등록 품목 전체', '현재 제출된 제품명']
-                )
-                st.download_button(
-                    label=f"📧 독촉 메일 발송 대상 통합 명단 다운로드 (전면 미제출 {len(zero_vendors_df)}개사 + 수량 부족 {len(short_vendors_df)}개사 = 총 {len(remind_all_df)}개사 / CSV)",
-                    data=convert_df_to_csv(remind_all_df[remind_cols]),
-                    file_name="독촉메일_발송대상_통합명단.csv",
-                    mime="text/csv",
-                    type="primary",
-                    key="t1_dl_remind_all"
-                )
+            # [그룹 2] 1건 이상 제출한 업체 중, 승인·미승인 구분 없이 아직 안 들어온 누락 품목 리스트
+            partial_missing_items_df = master_view[
+                (master_view['거래처_표시명'].isin(submitted_vendor_names)) &
+                (master_view['제출여부_통합'] == False)
+            ].copy()
+            partial_missing_items_df['거래처명'] = partial_missing_items_df['거래처_표시명']
+
+            # [그룹 3] 내부 검수 관리용 (승인 vs 미승인)
+            approved_master_df = master_view[master_view['승인여부'] == True].copy()
+            unapproved_master_df = master_view[master_view['승인여부'] == False].copy()
+            pending_sheet_df = valid_sub_df[valid_sub_df['검증상태'] == '대기중'].copy() if not valid_sub_df.empty else pd.DataFrame()
+
+            total_submitted_master_cnt = int(master_view['제출여부_통합'].sum())
+            total_approved_master_cnt = len(approved_master_df)
+            submit_rate_pct = round((total_submitted_master_cnt / total_items) * 100, 1) if total_items > 0 else 0.0
+            approve_rate_pct = round((total_approved_master_cnt / total_items) * 100, 1) if total_items > 0 else 0.0
+
+            # 상단 요약 지표 (독촉 관점 + 승인 관점 분리 표시)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("🔴 아예 안 낸 업체 (0건 제출)", f"{len(zero_vendors_df)}개사")
+            k2.metric("🟡 낸 업체의 누락 품목 (승인·미승인 무관)", f"{len(partial_missing_items_df)}건", f"{partial_missing_items_df['거래처명'].nunique() if not partial_missing_items_df.empty else 0}개사")
+            k3.metric("🔵 시트1 미승인(검수 대기중)", f"{len(pending_sheet_df)}건")
+            k4.metric("🟢 마스터 코드 승인 완료", f"{total_approved_master_cnt} / {total_items}건", f"승인률 {approve_rate_pct}%")
+
+            st.progress(min(1.0, submit_rate_pct / 100.0))
+            st.markdown(
+                f"**[제출 기준(승인·미승인 합산)] 전체 {total_items}건 중 {total_submitted_master_cnt}건 접수 ({submit_rate_pct}%)** "
+                f"&nbsp;|&nbsp; **[승인 기준] {total_approved_master_cnt}건 코드 확정 ({approve_rate_pct}%)**"
+            )
 
             st.markdown("---")
 
+            # 목적별로 완전히 분리된 4개 서브탭
             sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
-                f"🔴 전면 미제출 업체 ({len(zero_vendors_df)}개사)",
-                f"🟡 일부 미제출·수량 부족 업체 ({len(short_vendors_df)}개사)",
-                f"🟢 제출 수량 충족 업체 ({len(fulfilled_vendors_df)}개사)",
-                f"⚠️ 상호 미매칭 제출건 확인 ({len(unmatched_sub_df)}건)"
+                f"🔴 1. 아예 안 낸 업체 명단 ({len(zero_vendors_df)}개사)",
+                f"🟡 2. 낸 업체 중 누락 품목 ({len(partial_missing_items_df)}건)",
+                f"⚖️ 3. 승인 / 미승인 검수 현황 (대기 {len(pending_sheet_df)}건 · 승인 {total_approved_master_cnt}건)",
+                f"⚠️ 4. 상호 미매칭 제출건 확인 ({len(unmatched_sub_df)}건)"
             ])
 
-            # [서브탭 1] 1건도 제출하지 않은 전면 미제출 업체
+            # [서브탭 1] 아예 1건도 제출하지 않은 업체 명단
             with sub_tab1:
-                st.caption("검증 여부와 관계없이 '시트1'에 제출된 내역이 0건인 업체입니다. (1차 독촉 메일 발송 대상)")
+                st.caption("승인·미승인 구분 없이 '시트1'에 단 1건도 제출하지 않은 업체 명단입니다.")
                 if zero_vendors_df.empty:
                     st.success("🎉 전면 미제출 업체가 없습니다!")
                 else:
-                    q_zero = st.text_input("🔍 미제출 거래처명 또는 품목명 검색:", key="t1_zero_search")
+                    q_zero = st.text_input("🔍 업체명 또는 품목명 검색:", key="t1_zero_search")
                     view_zero = zero_vendors_df.copy()
                     if q_zero.strip():
                         kw = q_zero.strip()
                         view_zero = view_zero[
                             view_zero['거래처명'].astype(str).str.contains(kw, case=False, na=False) |
-                            view_zero['마스터 등록 품목 전체'].astype(str).str.contains(kw, case=False, na=False)
+                            view_zero['마스터 등록 품목 목록'].astype(str).str.contains(kw, case=False, na=False)
                         ]
 
                     zero_cols = (
-                        ['거래처명', '사업자번호', '마스터 품목수', '현재 제출 건수', '마스터 등록 품목 전체']
+                        ['거래처명', '사업자번호', '미제출 품목수', '마스터 등록 품목 목록']
                         if has_biz_col else
-                        ['거래처명', '마스터 품목수', '현재 제출 건수', '마스터 등록 품목 전체']
+                        ['거래처명', '미제출 품목수', '마스터 등록 품목 목록']
                     )
                     st.dataframe(
-                        view_zero[zero_cols].sort_values(by='마스터 품목수', ascending=False),
+                        view_zero[zero_cols].sort_values(by='미제출 품목수', ascending=False),
                         use_container_width=True,
                         hide_index=True
                     )
 
-                    col_dl_z1, col_dl_z2 = st.columns(2)
-                    with col_dl_z1:
+                    c_dl1, c_dl2 = st.columns(2)
+                    with c_dl1:
                         st.download_button(
-                            label=f"📥 전면 미제출 [업체별 요약표] 다운로드 ({len(view_zero)}개사 / CSV)",
+                            label=f"📥 아예 안 낸 업체 명단 다운로드 ({len(view_zero)}개사 / CSV)",
                             data=convert_df_to_csv(view_zero[zero_cols]),
-                            file_name="전면미제출_업체별요약.csv",
+                            file_name="전면_미제출_업체명단.csv",
                             mime="text/csv",
-                            key="t1_dl_zero_summary"
+                            key="t1_dl_zero_vendors"
                         )
-                    with col_dl_z2:
-                        zero_vendor_names = set(view_zero['거래처명'].tolist())
-                        zero_detail_cols = ['거래처명', '사업자번호', '품목코드', '품목명'] if has_biz_col else ['거래처명', '품목코드', '품목명']
-                        zero_detail_df = master_view[master_view['거래처_표시명'].isin(zero_vendor_names)].copy()
-                        zero_detail_df['거래처명'] = zero_detail_df['거래처_표시명']
+                    with c_dl2:
+                        zero_v_set = set(view_zero['거래처명'].tolist())
+                        z_item_cols = ['품목코드', '품목명', '거래처명', '사업자번호'] if has_biz_col else ['품목코드', '품목명', '거래처명']
+                        z_items_df = master_view[master_view['거래처_표시명'].isin(zero_v_set)].copy()
+                        z_items_df['거래처명'] = z_items_df['거래처_표시명']
                         st.download_button(
-                            label=f"📥 전면 미제출 [품목별 상세표] 다운로드 ({len(zero_detail_df)}건 / CSV)",
-                            data=convert_df_to_csv(zero_detail_df[zero_detail_cols]),
-                            file_name="전면미제출_품목별상세.csv",
+                            label=f"📥 아예 안 낸 업체의 품목별 상세 다운로드 ({len(z_items_df)}건 / CSV)",
+                            data=convert_df_to_csv(z_items_df[z_item_cols]),
+                            file_name="전면_미제출_품목상세.csv",
                             mime="text/csv",
-                            key="t1_dl_zero_detail"
+                            key="t1_dl_zero_items"
                         )
 
-            # [서브탭 2] 제출은 했으나 마스터 품목수보다 적게 제출한 업체
+            # [서브탭 2] 낸 업체 중 누락된 품목과 거래처명 (승인·미승인 무관)
             with sub_tab2:
-                st.caption("1건 이상 제출했으나 '시트1 제출 건수'가 '마스터 품목수'보다 적어 누락 품목이 있는 업체입니다. (추가 제출 요청 대상)")
-                if short_vendors_df.empty:
-                    st.success("🎉 수량이 부족한 일부 미제출 업체가 없습니다!")
+                st.caption("1건 이상 제출한 업체들 중에서, 이미 제출된 품목(승인완료 + 미승인 대기중 모두 포함)을 제외하고 아직 빠진 '누락 품목'과 '거래처명' 리스트입니다.")
+                if partial_missing_items_df.empty:
+                    st.success("🎉 제출 업체 중 누락된 품목이 없습니다!")
                 else:
-                    q_short = st.text_input("🔍 거래처명 또는 품목명 검색:", key="t1_short_search")
-                    view_short = short_vendors_df.copy()
-                    if q_short.strip():
-                        kw_s = q_short.strip()
-                        view_short = view_short[
-                            view_short['거래처명'].astype(str).str.contains(kw_s, case=False, na=False) |
-                            view_short['마스터 등록 품목 전체'].astype(str).str.contains(kw_s, case=False, na=False) |
-                            view_short['현재 제출된 제품명'].astype(str).str.contains(kw_s, case=False, na=False)
+                    q_part = st.text_input("🔍 누락 품목명, 품목코드 또는 거래처명 검색:", key="t1_part_search")
+                    view_part_items = partial_missing_items_df.copy()
+                    if q_part.strip():
+                        kw_p = q_part.strip()
+                        view_part_items = view_part_items[
+                            view_part_items['품목명'].astype(str).str.contains(kw_p, case=False, na=False) |
+                            view_part_items['품목코드'].astype(str).str.contains(kw_p, case=False, na=False) |
+                            view_part_items['거래처명'].astype(str).str.contains(kw_p, case=False, na=False)
                         ]
 
-                    short_cols = (
-                        ['거래처명', '사업자번호', '마스터 품목수', '현재 제출 건수', '미제출(부족) 건수', '마스터 등록 품목 전체', '현재 제출된 제품명']
-                        if has_biz_col else
-                        ['거래처명', '마스터 품목수', '현재 제출 건수', '미제출(부족) 건수', '마스터 등록 품목 전체', '현재 제출된 제품명']
-                    )
+                    part_item_cols = ['품목코드', '품목명', '거래처명']
+                    if has_biz_col:
+                        part_item_cols.append('사업자번호')
+                    if (view_part_items['업체_미분류_대기건'] != "").any():
+                        part_item_cols.append('업체_미분류_대기건')
+
                     st.dataframe(
-                        view_short[short_cols].sort_values(by='미제출(부족) 건수', ascending=False),
+                        view_part_items[part_item_cols].sort_values(by=['거래처명', '품목코드']),
                         use_container_width=True,
                         hide_index=True
                     )
 
                     st.download_button(
-                        label=f"📥 일부 미제출(수량 부족) 업체 리스트 다운로드 ({len(view_short)}개사 / CSV)",
-                        data=convert_df_to_csv(view_short[short_cols]),
-                        file_name="일부미제출_수량부족_업체리스트.csv",
+                        label=f"📥 제출 업체 중 누락 품목 리스트 다운로드 ({len(view_part_items)}건 / CSV)",
+                        data=convert_df_to_csv(view_part_items[part_item_cols]),
+                        file_name="제출업체_누락품목_리스트.csv",
                         mime="text/csv",
-                        key="t1_dl_short"
+                        key="t1_dl_part_items"
                     )
 
-                    st.markdown("#### 🔎 특정 거래처 선택 시 [마스터 품목 전체 vs 시트1 실제 제출 내역] 좌우 대조")
-                    sel_vendor = st.selectbox(
-                        "상세 확인할 거래처를 선택하세요:",
-                        options=["선택하세요"] + view_short['거래처명'].tolist(),
-                        key="t1_sel_vendor_detail"
+                    st.markdown("#### 🔎 특정 거래처 선택 시 [누락 품목 vs 실제 제출 내역(승인+대기)] 비교")
+                    part_vendor_opts = sorted(view_part_items['거래처명'].unique().tolist())
+                    sel_v = st.selectbox(
+                        "확인할 거래처를 선택하세요:",
+                        options=["선택하세요"] + part_vendor_opts,
+                        key="t1_sel_part_vendor"
                     )
+                    if sel_v != "선택하세요":
+                        cd1, cd2 = st.columns(2)
+                        with cd1:
+                            v_miss = view_part_items[view_part_items['거래처명'] == sel_v][['품목코드', '품목명']]
+                            st.error(f"🔴 [{sel_v}] 누락 품목 ({len(v_miss)}건)")
+                            st.dataframe(v_miss, use_container_width=True, hide_index=True)
+                        with cd2:
+                            v_sub_list = valid_sub_df[valid_sub_df['_매칭거래처'] == sel_v] if not valid_sub_df.empty else pd.DataFrame()
+                            st.info(f"📥 [{sel_v}] 시트1 실제 제출 내역 ({len(v_sub_list)}건 — 승인·대기 포함)")
+                            if not v_sub_list.empty:
+                                s_cols = [c for c in ['검증상태', '코드', '제품명', '공급사(판매원)', '제조원', '제출일시'] if c in v_sub_list.columns]
+                                st.dataframe(v_sub_list[s_cols], use_container_width=True, hide_index=True)
 
-                    if sel_vendor != "선택하세요":
-                        col_d1, col_d2 = st.columns(2)
-                        with col_d1:
-                            v_m_sub = master_view[master_view['거래처_표시명'] == sel_vendor][['품목코드', '품목명']]
-                            st.warning(f"📋 [{sel_vendor}] 마스터 등록 전체 품목 ({len(v_m_sub)}건)")
-                            st.dataframe(v_m_sub, use_container_width=True, hide_index=True)
-
-                        with col_d2:
-                            if not valid_sub_df.empty:
-                                v_s_sub = valid_sub_df[valid_sub_df['_매칭거래처'] == sel_vendor].copy()
-                            else:
-                                v_s_sub = pd.DataFrame()
-                            st.info(f"📥 [{sel_vendor}] 시트1 실제 제출 내역 ({len(v_s_sub)}건)")
-                            if v_s_sub.empty:
-                                st.caption("제출 내역이 없습니다.")
-                            else:
-                                sub_show_cols = [c for c in ['제품명', '식품유형', '제조원', '공급사(판매원)', '제출일시', '검증상태'] if c in v_s_sub.columns]
-                                st.dataframe(v_s_sub[sub_show_cols], use_container_width=True, hide_index=True)
-
-            # [서브탭 3] 마스터 품목수 이상 제출 완료한 업체 (독촉 제외)
+            # [서브탭 3] 내부 검수 관리: 승인 vs 미승인 별도 관리
             with sub_tab3:
-                st.caption("검증 여부와 무관하게 마스터 품목수 이상 제출을 완료하여 독촉 메일 대상에서 제외되는 업체입니다.")
-                if fulfilled_vendors_df.empty:
-                    st.info("아직 수량을 모두 충족한 업체가 없습니다.")
-                else:
-                    done_cols = (
-                        ['거래처명', '사업자번호', '마스터 품목수', '현재 제출 건수', '현재 제출된 제품명']
-                        if has_biz_col else
-                        ['거래처명', '마스터 품목수', '현재 제출 건수', '현재 제출된 제품명']
-                    )
-                    st.dataframe(
-                        fulfilled_vendors_df[done_cols].sort_values(by='현재 제출 건수', ascending=False),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                st.caption("독촉 명단과 별개로, 우리 팀 내부 검수 기준인 '미승인(검수 대기)' 건과 '승인 완료(마스터 코드 확정)' 건을 따로 관리합니다.")
+                col_a1, col_a2 = st.columns(2)
+                with col_a1:
+                    st.warning(f"🔵 시트1 미승인(검수 대기중) 제출 목록 ({len(pending_sheet_df)}건)")
+                    if pending_sheet_df.empty:
+                        st.success("현재 미승인 대기 건이 없습니다.")
+                    else:
+                        p_cols = [c for c in ['제품명', '공급사(판매원)', '제조원', '식품유형', '제출일시'] if c in pending_sheet_df.columns]
+                        st.dataframe(pending_sheet_df[p_cols], use_container_width=True, hide_index=True)
+                with col_a2:
+                    st.success(f"🟢 마스터 코드 승인 완료 리스트 ({len(approved_master_df)}건)")
+                    app_cols = ['품목코드', '품목명', '거래처명']
+                    st.dataframe(approved_master_df[app_cols], use_container_width=True, hide_index=True)
 
-            # [서브탭 4] 독촉 메일 발송 전 필수 확인: 상호 표기 불일치 제출건
+                with st.expander(f"📋 마스터 전체 기준 미승인 품목 전체 보기 ({len(unapproved_master_df)}건 — 미제출 + 대기중 포함)"):
+                    st.dataframe(unapproved_master_df[['품목코드', '품목명', '거래처명']], use_container_width=True, hide_index=True)
+
+            # [서브탭 4] 상호 표기 불일치 제출건 확인 (독촉 오발송 방지)
             with sub_tab4:
-                st.caption("⚠️ 중요: 업체가 시트1에 제출했으나 상호명을 마스터 명단과 다르게 적어 자동 연결되지 않은 건입니다. 독촉 메일 발송 전 아래 목록에 있는 업체인지 꼭 확인하세요.")
+                st.caption("업체가 시트1에 제출했으나 공급사(판매원)·제조원 명칭을 마스터 거래처명과 다르게 적어 자동 연결되지 않은 건입니다. 독촉 메일 발송 전 한번 확인해 주세요.")
                 if unmatched_sub_df.empty:
-                    st.success("🎉 시트1에 접수된 모든 품목이 마스터 거래처명과 100% 매칭되었습니다.")
+                    st.success("🎉 시트1의 모든 제출건이 마스터 거래처명과 정상 매칭되었습니다.")
                 else:
-                    st.warning(f"⚠️ 마스터 거래처명과 상호 표기가 달라 매칭되지 않은 제출건이 {len(unmatched_sub_df)}건 있습니다.")
-                    unmatched_cols = [c for c in ['제품명', '공급사(판매원)', '제조원', '식품유형', '제출일시', '검증상태'] if c in unmatched_sub_df.columns]
-                    st.dataframe(unmatched_sub_df[unmatched_cols], use_container_width=True, hide_index=True)
+                    st.warning(f"⚠️ 마스터 거래처명과 상호가 매칭되지 않은 제출건이 {len(unmatched_sub_df)}건 있습니다.")
+                    u_cols = [c for c in ['검증상태', '코드', '제품명', '공급사(판매원)', '제조원', '제출일시'] if c in unmatched_sub_df.columns]
+                    st.dataframe(unmatched_sub_df[u_cols], use_container_width=True, hide_index=True)
         else:
             st.info("구글 시트에 '전체 원재료 명단' 데이터가 없거나 헤더(품목코드, 품목명, 거래처명)를 확인해주세요.")
 
