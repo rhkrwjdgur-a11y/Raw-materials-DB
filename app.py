@@ -311,96 +311,163 @@ def load_master_data():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 공용 헬퍼 함수 (정밀 상호·품목 정규화 & 마스터 매칭)
+# 3. 공용 헬퍼 함수 (범용 상호·품목 정규화 & 제형 기반 마스터 매칭)
 # ==========================================
-GENERIC_CORP_SUFFIXES = (
-    "인터내셔널", "인터내셔날", "글로벌", "코리아", "산업", "상사", "통상", "무역",
-    "유통", "물산", "화학", "케미칼", "케미컬", "바이오", "바이오켐", "푸드", "푸드텍",
-    "식품", "향료", "제약", "상회", "농산", "축산", "수산", "에프앤비", "fnb", "food",
-    "foods", "korea", "global", "international"
-)
-
-OEM_NOISE_TOKENS = {
-    "프루티홈", "남양유업", "삼육케어", "한국메디칼푸드", "돌코리아", "비알", "빙그레",
-    "빙그레880", "빙그레캐옴", "넛유", "롯데칠성", "푸르밀", "뉴트리", "태국산", "중국산",
-    "호주산혼합", "소분", "20kg소분", "20kg", "foodgrade", "hy", "tof", "bk"
+ENG_LETTER_PRON = {
+    'a': '에이', 'b': '비', 'c': '씨', 'd': '디', 'e': '이', 'f': '에프',
+    'g': '지', 'h': '에이치', 'i': '아이', 'j': '제이', 'k': '케이', 'l': '엘',
+    'm': '엠', 'n': '엔', 'o': '오', 'p': '피', 'q': '큐', 'r': '알',
+    's': '에스', 't': '티', 'u': '유', 'v': '브이', 'w': '더블유', 'x': '엑스',
+    'y': '와이', 'z': '제트', '&': '엔'
 }
 
-def normalize_company_name(name, strip_parens=True):
-    """법인 기호, 수식어, 공백, 괄호 부가정보를 제거하여 핵심 상호명을 추출합니다."""
+KOR_PRON_TO_ENG = [
+    ("더블유", "w"), ("에이치", "h"), ("엑스", "x"), ("에프", "f"), ("브이", "v"),
+    ("와이", "y"), ("제트", "z"), ("제이", "j"), ("케이", "k"), ("에스", "s"),
+    ("에이", "a"), ("아이", "i"), ("엠", "m"), ("엔", "n"), ("엘", "l"),
+    ("알", "r"), ("비", "b"), ("씨", "c"), ("디", "d"), ("지", "g"),
+    ("피", "p"), ("큐", "q"), ("티", "t")
+]
+
+GENERIC_CORP_SUFFIXES = (
+    "인터내셔널", "인터내셔날", "인터내쇼날", "인터네셔널", "글로벌", "코퍼레이션", "트레이딩",
+    "코리아", "산업", "상사", "통상", "무역", "유통", "물산", "화학", "케미칼", "케미컬",
+    "바이오텍", "바이오켐", "바이오", "푸드텍", "푸드켐", "푸드", "식품", "향료", "제약",
+    "상회", "농산", "축산", "수산", "에프엔비", "에프앤비",
+    "international", "corporation", "trading", "global", "korea", "foods", "food", "fnb"
+)
+
+IGNORE_PAREN_TAGS = {
+    "주", "유", "합", "법인", "신규", "원료", "본사", "공장", "유지", "가공", "탈지",
+    "냉장", "상온", "수입", "직거래", "인천세관장", "oem", "oem원료"
+}
+
+FORM_CATEGORIES = {
+    "flavor": ("향료제제", "합성향료", "천연향료", "후레이바", "에센스", "향료", "향", "flavor", "flavour", "essence"),
+    "paste": ("페이스트", "버터", "퓨레", "매스", "paste", "puree"),
+    "concentrate": ("농축과즙", "농축액", "착즙액", "추출농축액", "추출액", "과즙", "주스농축액", "쥬스농축액", "농추액", "conc", "concentrate"),
+    "syrup": ("당시럽", "시럽", "올리고당", "물엿", "syrup"),
+    "oil": ("기름", "오일", "대두유", "옥배유", "해바라기유", "유지", "어유", "oil"),
+    "powder": ("추출물분말", "추출분말", "혼합분말", "분말", "파우더", "powder")
+}
+
+def clean_code_str(val):
+    """품목코드 문자열 정제 (소수점 .0 등 제거)."""
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+def phonetic_korean_fold(s):
+    """외래어 한글 표기 모음 편차(앤/엔, 애/에, 쇼날/셔널 등)를 표준 발음 형태로 통일합니다."""
+    if not s:
+        return ""
+    res = s
+    res = res.replace("인터내쇼날", "인터내셔널").replace("인터내셔날", "인터내셔널").replace("인터네셔널", "인터내셔널")
+    res = res.replace("에치와이", "에이치와이").replace("에치엔", "에이치엔")
+    res = res.replace("앤", "엔").replace("애", "에")
+    return res
+
+def spell_out_short_english(token):
+    """영문 이니셜(1~4자 알파벳 및 &)을 표준 한글 발음으로 범용 변환합니다."""
+    def repl(m):
+        eng = m.group(0).lower()
+        if len(eng) <= 4:
+            return "".join(ENG_LETTER_PRON.get(ch, ch) for ch in eng)
+        return eng
+    return re.sub(r'[a-zA-Z&]+', repl, token)
+
+def normalize_company_name(name, strip_parens=True, strip_branch=True):
+    """법인 기호, 수식어, 사업장(공장·지점 등) 접미사, 괄호 부가정보를 범용 제거합니다."""
     if pd.isna(name):
         return ""
     s = str(name).strip()
     s = re.sub(r'^(공급사|판매원|제조원|납품업체|거래처|상호명?)\s*[:：]\s*', '', s)
     s = s.replace("㈜", " ").replace("(주)", " ").replace("（주）", " ")
     s = s.replace("(유)", " ").replace("（유）", " ").replace("(합)", " ")
-    s = re.sub(r'(주식회사|유한회사|유한책임회사|합자회사|합명회사)', ' ', s)
+    s = re.sub(r'(농업회사법인|주식회사|유한회사|유한책임회사|합자회사|합명회사)', ' ', s)
     s = re.sub(r'\b(co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc|limited|company)\b', ' ', s, flags=re.IGNORECASE)
     if strip_parens:
         s = re.sub(r'\([^)]*\)', ' ', s)
         s = re.sub(r'\[[^\]]*\]', ' ', s)
-    s = re.sub(r'[^가-힣a-zA-Z0-9]', '', s).lower()
+    if strip_branch:
+        s = re.sub(r'[\s_]*([가-힣]{1,4})?(제?\d+)?(공장|지점|사업소|물류센터|연구소)\b', ' ', s)
+    s = re.sub(r'[^가-힣a-zA-Z0-9&]', '', s).lower()
     return s
 
-def extract_company_variants(raw_name):
-    """업체명에서 본명칭, 괄호 내 약칭, 영문 발음 표기 변형을 추출합니다."""
+def extract_company_keys(raw_name):
+    """상호명에서 주 식별키(본명칭·괄호병기 결합형·영문발음형)와 보조 어근키(일반 업종접미사 생략형)를 추출합니다."""
     if pd.isna(raw_name) or not str(raw_name).strip():
-        return set()
+        return set(), set()
     s = str(raw_name).strip()
-    variants = set()
-    c_core = normalize_company_name(s, strip_parens=True)
-    c_full = normalize_company_name(s, strip_parens=False)
-    if c_core:
-        variants.add(c_core)
-    if c_full:
-        variants.add(c_full)
+    raw_candidates = set()
+    c1 = normalize_company_name(s, strip_parens=True, strip_branch=True)
+    c2 = normalize_company_name(s, strip_parens=False, strip_branch=True)
+    if c1:
+        raw_candidates.add(c1)
+    if c2:
+        raw_candidates.add(c2)
 
-    ignore_tags = {"주", "유", "합", "본사", "공장", "유지", "가공", "탈지", "냉장", "상온", "수입", "직거래", "인천세관장"}
-    for p in re.findall(r'\(([^)]+)\)', s):
-        p_clean = normalize_company_name(p, strip_parens=True)
-        if p_clean and p_clean not in ignore_tags and len(p_clean) >= 2:
-            variants.add(p_clean)
+    for pm in re.finditer(r'\(([^)]+)\)', s):
+        inside = pm.group(1).strip()
+        inside_clean = normalize_company_name(inside, strip_parens=True, strip_branch=True)
+        if inside_clean and inside_clean not in IGNORE_PAREN_TAGS:
+            if len(inside_clean) >= 2:
+                raw_candidates.add(inside_clean)
+            after_str = s[pm.end():]
+            combined_after = normalize_company_name(inside + after_str, strip_parens=True, strip_branch=True)
+            if combined_after and len(combined_after) >= 2:
+                raw_candidates.add(combined_after)
 
-    expanded = set(variants)
-    for v in variants:
-        v_kor = (
-            v.replace("hy", "에이치와이")
-             .replace("fi", "에프아이")
-             .replace("f&f", "에프앤에프")
-             .replace("fnf", "에프앤에프")
-             .replace("tof", "티오에프")
-             .replace("jj", "제이제이")
-             .replace("nnp", "앤앤피")
-             .replace("bk", "비케이")
-             .replace("tr", "티알")
-             .replace("hn", "에이치엔")
-             .replace("csf", "씨에스에프")
-        )
-        expanded.add(v_kor)
-    return expanded
+    primary_keys = set()
+    for rc in raw_candidates:
+        f1 = phonetic_korean_fold(rc)
+        f2 = phonetic_korean_fold(spell_out_short_english(rc))
+        if f1:
+            primary_keys.add(f1)
+        if f2:
+            primary_keys.add(f2)
 
-def is_same_company(vendor_input, master_vendor):
-    """공급사(판매원)와 마스터 거래처명을 엄격 대조합니다 (무작위 짧은 단어 포함 오매칭 차단)."""
-    sv_set = extract_company_variants(vendor_input)
-    mv_set = extract_company_variants(master_vendor)
-    if not sv_set or not mv_set:
+    stem_keys = set()
+    for pk in list(primary_keys):
+        for suf in GENERIC_CORP_SUFFIXES:
+            suf_fold = phonetic_korean_fold(suf)
+            if pk.endswith(suf_fold) and len(pk) - len(suf_fold) >= 2:
+                stem_keys.add(pk[:-len(suf_fold)])
+
+    return primary_keys, stem_keys
+
+def is_same_company(vendor_input, master_vendor, allow_stem=True):
+    """두 상호명의 동일 법인 여부를 범용 규칙으로 판별합니다."""
+    p_a, s_a = extract_company_keys(vendor_input)
+    p_b, s_b = extract_company_keys(master_vendor)
+    if not p_a or not p_b:
         return False
-
-    if sv_set & mv_set:
+    if p_a & p_b:
         return True
-
-    for sv in sv_set:
-        for mv in mv_set:
-            shorter, longer = (sv, mv) if len(sv) <= len(mv) else (mv, sv)
-            if len(shorter) >= 3 and longer.startswith(shorter):
-                rem = longer[len(shorter):]
-                if rem in GENERIC_CORP_SUFFIXES:
-                    return True
+    if allow_stem and ((p_a & s_b) or (s_a & p_b)):
+        return True
     return False
 
+def convert_kor_model_code(s):
+    """한글 알파벳 발음+숫자 모델코드(예: 지피1417->gp1417, 에프비06->fb06)를 영문 모델코드로 범용 변환합니다."""
+    pron_pat = "|".join(k for k, _ in KOR_PRON_TO_ENG)
+    def repl(m):
+        kor_part = m.group(1)
+        num_part = m.group(2)
+        out = kor_part
+        for k, v in KOR_PRON_TO_ENG:
+            out = out.replace(k, v)
+        return out + num_part
+    return re.sub(rf'((?:{pron_pat}){{1,3}})(\+?\d+)', repl, s)
+
 def normalize_food_item(text):
-    """식품첨가물 이명·영문 약어·발음 표기 차이를 표준화합니다."""
-    s = re.sub(r'\s+', '', str(text).strip().lower())
+    """식품·첨가물 이명, 한글 발음 모델코드, 철자 변이를 표준화합니다."""
+    s = re.sub(r'^(제품명|품목명)\s*[:：]\s*', '', str(text).strip().lower())
+    s = re.sub(r'\s+', '', s)
+    s = convert_kor_model_code(s)
     replacements = [
         ("구연산삼나트륨", "구연산나트륨"),
         ("구연산소다", "구연산나트륨"),
@@ -411,12 +478,15 @@ def normalize_food_item(text):
         ("carboxymethylcellulose", "cmc"),
         ("아비셀플러스", "avicel+"),
         ("아비셀", "avicel"),
-        ("지피", "gp"),
         ("초코렛", "초코"),
         ("초콜렛", "초코"),
         ("초콜릿", "초코"),
         ("흑임자", "검은깨"),
         ("검은참깨", "검은깨"),
+        ("메론", "멜론"),
+        ("쥬스", "주스"),
+        ("농추액", "농축액"),
+        ("파우더", "분말"),
         ("정제소금", "정제염"),
         ("본소금", "정제염"),
         ("비타민-", "비타민"),
@@ -425,8 +495,22 @@ def normalize_food_item(text):
         s = s.replace(k, v)
     return s
 
+def detect_item_form(item_name, food_type=""):
+    """품목명 및 식품유형에서 원료의 물리적·규격적 제형(향료/페이스트/농축액/시럽/유지/분말)을 판별합니다."""
+    base = re.sub(r'\([^)]*\)', ' ', str(item_name)).lower().strip()
+    ft = str(food_type).lower().strip()
+    if ft in ("향료", "향료제제"):
+        return "flavor"
+    if re.search(r'(후레이바|에센스|향료|향\s*(?:#\d+|_\w+|\d+|[a-z]{1,4}-?\d+)?$)', base) or ("향" in base and re.search(r'향(?:\s|#|\(|\[|_|-|$)', base)):
+        return "flavor"
+    for cat in ("paste", "concentrate", "syrup", "oil", "powder"):
+        for kw in FORM_CATEGORIES[cat]:
+            if kw in base:
+                return cat
+    return None
+
 def calc_name_similarity(a, b):
-    """일반 수식어('농축액', '혼합제제' 등) 착시를 배제한 품목명 유사도를 계산합니다."""
+    """일반 제형 수식어 착시를 배제한 핵심 원료명 유사도를 계산합니다."""
     s1 = re.sub(r'[^가-힣a-z0-9+#]', '', normalize_food_item(a))
     s2 = re.sub(r'[^가-힣a-z0-9+#]', '', normalize_food_item(b))
     if not s1 or not s2:
@@ -434,7 +518,7 @@ def calc_name_similarity(a, b):
     if s1 == s2:
         return 1.0
 
-    generic_words = ["혼합제제", "분말", "농축과즙", "농축액", "추출분말", "추출액", "페이스트", "시럽", "향", "과즙"]
+    generic_words = ["혼합제제", "농축과즙", "추출물분말", "추출분말", "주스농축액", "과즙농축액", "농축액", "추출액", "페이스트", "시럽", "분말", "과즙", "향"]
     c1, c2 = s1, s2
     for gw in generic_words:
         if len(c1) > len(gw) + 1:
@@ -459,7 +543,7 @@ def calc_name_similarity(a, b):
     return base_sim
 
 def extract_item_segments(name, vendor_name=""):
-    """마스터 품목명의 괄호 밖 본명칭과 괄호 안 세부 모델명(고객사 노이즈 제외)을 분리 추출합니다."""
+    """품목명의 괄호 밖 본명칭과 괄호 안 규격·모델명(원산지·단순중량·위탁사 태그 제외)을 분리 추출합니다."""
     raw = str(name).strip()
     segs = {normalize_food_item(raw)}
     outside = re.sub(r'\([^)]*\)', ' ', raw).strip()
@@ -467,19 +551,29 @@ def extract_item_segments(name, vendor_name=""):
         segs.add(normalize_food_item(outside))
 
     v_clean = re.sub(r'[^가-힣a-z0-9]', '', normalize_food_item(vendor_name))
+    noise_pattern = re.compile(r'^(?:\d+kg|\d+g|\d+brix|[가-힣]{2,5}산|호주산혼합|소분|무상사급|공용|저당|분말|호상)$')
+    oem_keywords = ("유업", "빙그레", "삼육", "메디칼", "돌코리아", "비알", "프루티홈", "푸르밀", "뉴트리", "이롬", "동원", "파스퇴르", "아티튜드", "소이마스터", "롯데", "해태", "오롯", "넛유", "곽철이")
     for grp in re.findall(r'\(([^)]+)\)', raw):
         for part in re.split(r'[,/]', grp):
             p_norm = normalize_food_item(part)
             p_alnum = re.sub(r'[^가-힣a-z0-9+#]', '', p_norm)
             if not p_alnum or len(p_alnum) < 2:
                 continue
-            if p_alnum in OEM_NOISE_TOKENS or (v_clean and p_alnum == v_clean):
+            if (v_clean and p_alnum == v_clean) or p_alnum in {"hy", "tof", "bk", "can", "di", "foodgrade"}:
+                continue
+            if noise_pattern.match(p_alnum) or any(ok in p_alnum for ok in oem_keywords):
                 continue
             segs.add(p_norm)
     return {re.sub(r'[^가-힣a-z0-9+#]', '', x) for x in segs if re.sub(r'[^가-힣a-z0-9+#]', '', x)}
 
-def smart_item_match_score(sub_name, master_name, vendor_name=""):
-    """동일 거래처 내에서 업체 제출 제품명과 마스터 품목명의 정밀 일치 점수를 반환합니다."""
+def smart_item_match_score(sub_name, master_name, vendor_name="", sub_food_type=""):
+    """제형 호환성 검증(향료 vs 페이스트 등 오매칭 차단) 및 모델번호·이명 기반 일치 점수를 반환합니다."""
+    f_sub = detect_item_form(sub_name, sub_food_type)
+    f_mst = detect_item_form(master_name, "")
+    if f_sub and f_mst and f_sub != f_mst:
+        if "flavor" in (f_sub, f_mst) or "paste" in (f_sub, f_mst) or "oil" in (f_sub, f_mst) or "syrup" in (f_sub, f_mst):
+            return 0.0
+
     sub_segs = extract_item_segments(sub_name, vendor_name)
     mst_segs = extract_item_segments(master_name, vendor_name)
     if not sub_segs or not mst_segs:
@@ -496,7 +590,7 @@ def smart_item_match_score(sub_name, master_name, vendor_name=""):
     if common_models:
         return 0.95
 
-    generic_only = {"혼합제제", "농축액", "과즙농축액", "페이스트", "추출분말", "추출액", "분말", "시럽"}
+    generic_only = {"혼합제제", "농축액", "과즙농축액", "주스농축액", "페이스트", "추출분말", "추출액", "분말", "시럽"}
     best = 0.0
     for ss in sub_segs:
         for ms in mst_segs:
@@ -514,14 +608,16 @@ def filter_master_candidates(master_df, vendor_name, product_name):
         return {"공급사_일치_품목": [], "품목명_유사_참고후보": []}, pd.DataFrame()
 
     work_df = master_df[['품목코드', '품목명', '거래처명']].copy()
-    work_df['품목코드'] = work_df['품목코드'].astype(str).str.strip()
+    work_df['품목코드'] = work_df['품목코드'].apply(clean_code_str)
     work_df = work_df[work_df['품목코드'] != '']
 
-    # 1차: 공급사(판매원) ↔ 거래처명 엄격 매칭
-    vendor_mask = work_df['거래처명'].apply(lambda mv: is_same_company(vendor_name, mv))
+    # 1차: 공급사(판매원) ↔ 거래처명 범용 매칭 (주 식별키 우선 -> 업종접미사 생략 어근 차선)
+    vendor_mask = work_df['거래처명'].apply(lambda mv: is_same_company(vendor_name, mv, allow_stem=False))
+    if not vendor_mask.any():
+        vendor_mask = work_df['거래처명'].apply(lambda mv: is_same_company(vendor_name, mv, allow_stem=True))
     vendor_matched_df = work_df[vendor_mask].drop_duplicates()
 
-    # 2차: 품목명 정밀 유사도 상위 후보 추출 (공급사 오기재 대비용)
+    # 2차: 제형·모델명 반영 정밀 유사도 상위 후보 추출
     work_df['_sim'] = work_df.apply(
         lambda r: smart_item_match_score(product_name, r['품목명'], r['거래처명']), axis=1
     )
@@ -560,8 +656,8 @@ def verify_with_ai(file_bytes, mime_type, vendor_data, candidates_payload):
 
     [작업 2: 사내 원자재 마스터 품목코드 자동 매칭]
     아래 제공된 '사내 원자재 후보 명단(JSON)'에서 업체가 제출한 [공급사(판매원): {vendor_data.get('공급사(판매원)', '')}] 및 [제품명: {vendor_data['제품명']}]과 일치하는 품목을 찾아 `품목코드`를 매칭하세요.
-    - 1순위 원칙: `공급사_일치_품목` 리스트(해당 거래처가 당사에 납품하는 품목 목록) 안에서 제품명·모델번호·이명(예: 구연산삼나트륨=구연산나트륨, CMC=카복시메틸셀룰로스나트륨, Avicel=아비셀 등)이 일치하는 품목코드를 최우선 선택하세요.
-    - 2순위 원칙: `공급사_일치_품목`에 해당 품목이 없을 때만 `품목명_유사_참고후보`를 확인하되, 거래처명이 전혀 다른 타사 OEM 전용 품목(예: 공급사가 롯데칠성이 아닌데 거래처가 롯데칠성인 코드 등)은 절대 추천하지 말고 불확실하면 '없음'으로 기재하세요.
+    - 1순위 원칙: `공급사_일치_품목` 리스트(해당 거래처가 당사에 납품하는 품목 목록) 안에서 제품명·제형·모델번호·이명(예: 구연산삼나트륨=구연산나트륨, CMC=카복시메틸셀룰로스나트륨, Avicel=아비셀 등)이 일치하는 품목코드를 최우선 선택하세요.
+    - 2순위 원칙: `공급사_일치_품목`에 해당 품목이 없을 때만 `품목명_유사_참고후보`를 확인하되, 거래처명이 전혀 다른 타사 OEM 전용 품목이나 제형이 다른 품목(향료 vs 페이스트 등)은 절대 추천하지 말고 불확실하면 '없음'으로 기재하세요.
     - 사내 원자재 후보 명단(JSON): {candidates_json}
 
     [출력 형식] (반드시 아래 양식을 지켜 순수 텍스트로만 출력하세요)
@@ -883,12 +979,12 @@ else:
     df = load_sheet_data()
     master_df = standardize_master_columns(load_master_data())
 
-    # ------------------ [탭 1: 수취 현황판 (정밀 미제출 독촉 & 승인 분리)] ------------------
+    # ------------------ [탭 1: 수취 현황판 (범용 법인통합 & 제형검증 기반 관제)] ------------------
     with admin_tab1:
         col_t1_title, col_t1_btn = st.columns([8, 2])
         with col_t1_title:
             st.markdown("### 📈 협력업체 라벨 제출 현황 및 승인 관제")
-            st.caption("공급사(판매원) 엄격 매칭 및 이명·모델명 분석을 적용하여 ① 전면 미제출 업체, ② 제출 업체 중 누락 품목(승인·미승인 무관), ③ 승인/미승인 현황을 정확히 분리합니다.")
+            st.caption("범용 상호 정규화(공장명·모음편차·이니셜·동일법인 통합) 및 원료 제형 검증을 적용하여 ① 전면 미제출 업체, ② 제출 업체 중 누락 품목, ③ 승인/미승인 현황을 정밀 분리합니다.")
         with col_t1_btn:
             st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
             if st.button("🔄 최신 데이터 불러오기", key="t1_btn_refresh", use_container_width=True):
@@ -897,19 +993,63 @@ else:
 
         if not master_df.empty and '품목코드' in master_df.columns:
             master_view = master_df.copy()
-            master_view['품목코드'] = master_view['품목코드'].astype(str).str.strip()
+            master_view['품목코드'] = master_view['품목코드'].apply(clean_code_str)
             master_view = master_view[master_view['품목코드'] != ''].reset_index(drop=True)
             master_view['거래처명_원본'] = master_view['거래처명'].fillna('').astype(str).str.strip()
             master_view['거래처_표시명'] = master_view['거래처명_원본'].apply(lambda x: x if x else "(거래처 미기재)")
             has_biz_col = '사업자번호' in master_view.columns
+            master_view['사업자번호_정제'] = (
+                master_view['사업자번호'].fillna('').astype(str).str.strip() if has_biz_col else ""
+            )
 
             total_items = len(master_view)
+
+            # [범용 동일법인 클러스터링] 마스터 시트 내 표기만 다른 동일 법인 자동 병합 (단, 사업자번호가 서로 다르면 별개 법인으로 보호)
+            unique_v_rows = []
+            for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
+                biz_set = {b for b in grp['사업자번호_정제'].unique() if b and b != '-'}
+                unique_v_rows.append({'v_disp': v_disp, 'biz_set': biz_set, 'count': len(grp)})
+
+            parent_map = {i: i for i in range(len(unique_v_rows))}
+            def find_root(i):
+                while parent_map[i] != i:
+                    parent_map[i] = parent_map[parent_map[i]]
+                    i = parent_map[i]
+                return i
+
+            def union_roots(i, j):
+                ri, rj = find_root(i), find_root(j)
+                if ri != rj:
+                    if (bool(unique_v_rows[ri]['biz_set']), unique_v_rows[ri]['count']) >= (bool(unique_v_rows[rj]['biz_set']), unique_v_rows[rj]['count']):
+                        parent_map[rj] = ri
+                    else:
+                        parent_map[ri] = rj
+
+            for i in range(len(unique_v_rows)):
+                for j in range(i + 1, len(unique_v_rows)):
+                    vi, vj = unique_v_rows[i], unique_v_rows[j]
+                    if vi['v_disp'] == "(거래처 미기재)" or vj['v_disp'] == "(거래처 미기재)":
+                        continue
+                    if vi['biz_set'] and vj['biz_set'] and not (vi['biz_set'] & vj['biz_set']):
+                        continue
+                    if is_same_company(vi['v_disp'], vj['v_disp'], allow_stem=False):
+                        union_roots(i, j)
+
+            v_to_group_name = {}
+            group_aliases = {}
+            for idx, item in enumerate(unique_v_rows):
+                r_idx = find_root(idx)
+                rep_name = unique_v_rows[r_idx]['v_disp']
+                v_to_group_name[item['v_disp']] = rep_name
+                group_aliases.setdefault(rep_name, []).append(item['v_disp'])
+
+            master_view['통합거래처명'] = master_view['거래처_표시명'].map(v_to_group_name)
 
             # 시트1 유효 제출 데이터 정리
             valid_sub_df = pd.DataFrame()
             if not df.empty:
                 valid_sub_df = df.copy()
-                for req_col in ['코드', '제품명', '공급사(판매원)', '제조원', '검증상태', '제출일시']:
+                for req_col in ['코드', '제품명', '식품유형', '공급사(판매원)', '제조원', '검증상태', '제출일시']:
                     if req_col not in valid_sub_df.columns:
                         valid_sub_df[req_col] = ""
                 non_empty_mask = (
@@ -918,43 +1058,51 @@ else:
                     (valid_sub_df['제조원'].astype(str).str.strip() != '')
                 )
                 valid_sub_df = valid_sub_df[non_empty_mask].copy()
-                valid_sub_df['코드'] = valid_sub_df['코드'].astype(str).str.strip()
+                valid_sub_df['코드'] = valid_sub_df['코드'].apply(clean_code_str)
                 valid_sub_df['검증상태'] = valid_sub_df['검증상태'].astype(str).str.strip()
 
-            # 마스터 거래처 목록 및 코드별 거래처 인덱스 구성
-            vendor_items_map = {}
-            for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
-                vendor_items_map[v_disp] = grp['품목명'].astype(str).tolist()
-
-            all_master_vendors = [k for k in vendor_items_map.keys() if k != "(거래처 미기재)"]
+            vendor_items_map = {
+                gv: grp['품목명'].astype(str).tolist()
+                for gv, grp in master_view.groupby('통합거래처명', sort=False)
+            }
+            all_group_vendors = [k for k in group_aliases.keys() if k != "(거래처 미기재)"]
 
             code_to_vendors = {}
             code_to_names = {}
             for _, r in master_view.iterrows():
                 c_val = r['품목코드']
-                code_to_vendors.setdefault(c_val, []).append(r['거래처_표시명'])
+                code_to_vendors.setdefault(c_val, []).append(r['통합거래처명'])
                 code_to_names[c_val] = r['품목명']
             code_to_vendors = {k: list(dict.fromkeys(v)) for k, v in code_to_vendors.items()}
 
-            # 오직 '공급사(판매원)' 기준으로만 마스터 거래처 매칭 (제조원 오매칭 원천 차단; 공급사 칸이 빈 과거 데이터만 예외 허용)
+            # 공급사(판매원) 기준 2단계 우선순위 매칭 (1순위: 주 식별키 일치 -> 2순위: 업종접미사 생략 어근 일치)
             def find_matching_master_vendor(s_row):
                 s_prod = str(s_row.get('제품명', '')).strip()
+                s_type = str(s_row.get('식품유형', '')).strip()
                 s_vendor = str(s_row.get('공급사(판매원)', '')).strip()
                 s_maker = str(s_row.get('제조원', '')).strip()
                 target_company = s_vendor if s_vendor else s_maker
                 if not target_company:
                     return None
 
-                matched_v_list = [mv for mv in all_master_vendors if is_same_company(target_company, mv)]
+                matched_v_list = [
+                    gv for gv in all_group_vendors
+                    if any(is_same_company(target_company, alias, allow_stem=False) for alias in group_aliases[gv])
+                ]
+                if not matched_v_list:
+                    matched_v_list = [
+                        gv for gv in all_group_vendors
+                        if any(is_same_company(target_company, alias, allow_stem=True) for alias in group_aliases[gv])
+                    ]
+
                 if not matched_v_list:
                     return None
                 if len(matched_v_list) == 1:
                     return matched_v_list[0]
 
-                # 동일 법인이 마스터에 '(유지)', '(가공)' 등으로 나뉘어 있을 때 품목명 유사도가 가장 높은 쪽 선택
                 best_mv, best_sc = matched_v_list[0], -1.0
                 for mv in matched_v_list:
-                    scores = [smart_item_match_score(s_prod, it, mv) for it in vendor_items_map[mv]]
+                    scores = [smart_item_match_score(s_prod, it, mv, s_type) for it in vendor_items_map[mv]]
                     max_sc = max(scores) if scores else 0.0
                     if max_sc > best_sc:
                         best_sc = max_sc
@@ -966,7 +1114,6 @@ else:
                 valid_sub_df['_매칭거래처'] = valid_sub_df.apply(find_matching_master_vendor, axis=1)
                 unmatched_sub_df = valid_sub_df[valid_sub_df['_매칭거래처'].isna()].copy()
 
-                # 타 거래처 전용 코드가 잘못 부여된 오매핑 행 탐지 (예: 일반 공급사 제출건에 롯데칠성 코드 부여 등)
                 coded_all = valid_sub_df[valid_sub_df['코드'] != '']
                 for _, crow in coded_all.iterrows():
                     sc = crow['코드']
@@ -987,7 +1134,7 @@ else:
 
             code_mismatch_df = pd.DataFrame(code_mismatch_list)
 
-            # 마스터 품목별 상태 판별 (오직 공급사가 실제 일치하는 제출건만 해당 거래처 실적으로 인정)
+            # 마스터 통합거래처 단위 품목별 상태 판별
             master_view['승인여부'] = False
             master_view['제출여부_통합'] = False
             master_view['매칭된_제출제품명'] = ""
@@ -996,19 +1143,22 @@ else:
             zero_vendor_list = []
             submitted_vendor_names = set()
 
-            for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
+            for v_disp, grp in master_view.groupby('통합거래처명', sort=False):
                 m_indices = grp.index.tolist()
                 if not valid_sub_df.empty:
                     v_subs = valid_sub_df[valid_sub_df['_매칭거래처'] == v_disp].copy()
                 else:
                     v_subs = pd.DataFrame()
 
+                biz_str = ""
+                if has_biz_col:
+                    biz_vals = [str(x).strip() for x in grp['사업자번호_정제'].unique() if str(x).strip() and str(x).strip() != '-']
+                    biz_str = ", ".join(biz_vals) if biz_vals else "-"
+                    for idx in m_indices:
+                        if not master_view.loc[idx, '사업자번호_정제']:
+                            master_view.loc[idx, '사업자번호'] = biz_str
+
                 if v_subs.empty:
-                    # 실제 공급사 기준 1건도 제출하지 않은 전면 미제출 업체
-                    biz_str = ""
-                    if has_biz_col:
-                        biz_vals = [str(x).strip() for x in grp['사업자번호'].unique() if str(x).strip()]
-                        biz_str = ", ".join(biz_vals)
                     item_list_str = ", ".join([f"[{r['품목코드']}] {r['품목명']}" for _, r in grp.iterrows()])
                     zero_vendor_list.append({
                         '거래처명': v_disp,
@@ -1023,7 +1173,7 @@ else:
                 used_sub_indices = set()
                 matched_m_indices = set()
 
-                # 1단계: 해당 거래처 제출건 중 코드 승인 완료건 매칭
+                # 1단계: 코드 승인 완료건 매칭
                 coded_subs = v_subs[v_subs['코드'] != '']
                 for s_idx, s_row in coded_subs.iterrows():
                     sc = s_row['코드']
@@ -1035,7 +1185,7 @@ else:
                             matched_m_indices.add(idx)
                             used_sub_indices.add(s_idx)
 
-                # 2단계: 미승인 대기건(또는 타코드 부여건)을 정밀 품목명·모델번호·이명 점수로 1:1 매칭
+                # 2단계: 미승인 대기건 제형·모델번호·이명 기반 1:1 매칭
                 rem_m_indices = [idx for idx in m_indices if idx not in matched_m_indices]
                 rem_subs = v_subs[~v_subs.index.isin(used_sub_indices)]
 
@@ -1052,7 +1202,8 @@ else:
                         m_name = master_view.loc[idx, '품목명']
                         for s_idx, s_row in rem_subs.iterrows():
                             s_name = str(s_row.get('제품명', ''))
-                            sc_val = smart_item_match_score(s_name, m_name, v_disp)
+                            s_type = str(s_row.get('식품유형', ''))
+                            sc_val = smart_item_match_score(s_name, m_name, v_disp, s_type)
                             if sc_val >= 0.60:
                                 pair_candidates.append((sc_val, idx, s_idx, s_name))
                     pair_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -1063,7 +1214,6 @@ else:
                             matched_m_indices.add(idx)
                             used_sub_indices.add(s_idx)
 
-                # 해당 업체가 제출한 다른 미매칭 건이 남아 있을 때만 참고 표시
                 leftover_subs = v_subs[~v_subs.index.isin(used_sub_indices)]
                 if not leftover_subs.empty:
                     leftover_names = ", ".join(leftover_subs['제품명'].astype(str).tolist())
@@ -1075,10 +1225,10 @@ else:
             zero_vendors_df = pd.DataFrame(zero_vendor_list)
 
             partial_missing_items_df = master_view[
-                (master_view['거래처_표시명'].isin(submitted_vendor_names)) &
+                (master_view['통합거래처명'].isin(submitted_vendor_names)) &
                 (master_view['제출여부_통합'] == False)
             ].copy()
-            partial_missing_items_df['거래처명'] = partial_missing_items_df['거래처_표시명']
+            partial_missing_items_df['거래처명'] = partial_missing_items_df['통합거래처명']
 
             approved_master_df = master_view[master_view['승인여부'] == True].copy()
             unapproved_master_df = master_view[master_view['승인여부'] == False].copy()
@@ -1090,7 +1240,6 @@ else:
             approve_rate_pct = round((total_approved_master_cnt / total_items) * 100, 1) if total_items > 0 else 0.0
             check_needed_cnt = len(unmatched_sub_df) + len(code_mismatch_df)
 
-            # 상단 요약 KPI
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("🔴 아예 안 낸 업체 (0건 제출)", f"{len(zero_vendors_df)}개사")
             k2.metric("🟡 낸 업체의 누락 품목 (승인·미승인 무관)", f"{len(partial_missing_items_df)}건", f"{partial_missing_items_df['거래처명'].nunique() if not partial_missing_items_df.empty else 0}개사")
@@ -1112,9 +1261,8 @@ else:
                 f"⚠️ 4. 상호 미매칭 / 코드 오매핑 점검 ({check_needed_cnt}건)"
             ])
 
-            # [서브탭 1] 아예 1건도 제출하지 않은 업체 명단
             with sub_tab1:
-                st.caption("공급사(판매원) 기준으로 '시트1'에 단 1건도 제출하지 않은 업체 명단입니다. (타 업체 코드 오매핑 건은 제외되어 정확히 집계됨)")
+                st.caption("공급사(판매원) 기준으로 '시트1'에 단 1건도 제출하지 않은 업체 명단입니다.")
                 if zero_vendors_df.empty:
                     st.success("🎉 전면 미제출 업체가 없습니다!")
                 else:
@@ -1143,15 +1291,15 @@ else:
                         st.download_button(
                             label=f"📥 아예 안 낸 업체 명단 다운로드 ({len(view_zero)}개사 / CSV)",
                             data=convert_df_to_csv(view_zero[zero_cols]),
-                            file_name="전면_미제출_업체명단.csv",
+                            file_name="원자재 한글라벨 미제출_업체명단.csv",
                             mime="text/csv",
                             key="t1_dl_zero_vendors"
                         )
                     with c_dl2:
                         zero_v_set = set(view_zero['거래처명'].tolist())
                         z_item_cols = ['품목코드', '품목명', '거래처명', '사업자번호'] if has_biz_col else ['품목코드', '품목명', '거래처명']
-                        z_items_df = master_view[master_view['거래처_표시명'].isin(zero_v_set)].copy()
-                        z_items_df['거래처명'] = z_items_df['거래처_표시명']
+                        z_items_df = master_view[master_view['통합거래처명'].isin(zero_v_set)].copy()
+                        z_items_df['거래처명'] = z_items_df['통합거래처명']
                         st.download_button(
                             label=f"📥 아예 안 낸 업체의 품목별 상세 다운로드 ({len(z_items_df)}건 / CSV)",
                             data=convert_df_to_csv(z_items_df[z_item_cols]),
@@ -1160,9 +1308,8 @@ else:
                             key="t1_dl_zero_items"
                         )
 
-            # [서브탭 2] 낸 업체 중 누락된 품목과 거래처명
             with sub_tab2:
-                st.caption("실제 1건 이상 제출한 공급사들 중에서, 이미 제출된 품목(승인완료 + 미승인 대기중 이명·모델명 일치건 모두 포함)을 제외하고 아직 안 들어온 누락 품목과 거래처명입니다.")
+                st.caption("1건 이상 제출한 공급사들 중에서, 이미 제출된 품목(승인완료 + 미승인 대기중 일치건 모두 포함)을 제외하고 아직 안 들어온 누락 품목과 거래처명입니다.")
                 if partial_missing_items_df.empty:
                     st.success("🎉 제출 업체 중 누락된 품목이 없습니다!")
                 else:
@@ -1213,10 +1360,9 @@ else:
                             v_sub_list = valid_sub_df[valid_sub_df['_매칭거래처'] == sel_v] if not valid_sub_df.empty else pd.DataFrame()
                             st.info(f"📥 [{sel_v}] 시트1 실제 제출 내역 ({len(v_sub_list)}건 — 승인·대기 포함)")
                             if not v_sub_list.empty:
-                                s_cols = [c for c in ['검증상태', '코드', '제품명', '공급사(판매원)', '제조원', '제출일시'] if c in v_sub_list.columns]
+                                s_cols = [c for c in ['검증상태', '코드', '제품명', '식품유형', '공급사(판매원)', '제조원', '제출일시'] if c in v_sub_list.columns]
                                 st.dataframe(v_sub_list[s_cols], use_container_width=True, hide_index=True)
 
-            # [서브탭 3] 내부 검수 관리: 승인 vs 미승인 별도 관리
             with sub_tab3:
                 st.caption("독촉 명단과 별개로, 내부 품질검수 기준인 '미승인(검수 대기)' 건과 '승인 완료(거래처·코드 정상 확정)' 건을 따로 관리합니다.")
                 col_a1, col_a2 = st.columns(2)
@@ -1235,10 +1381,9 @@ else:
                 with st.expander(f"📋 마스터 전체 기준 미승인 품목 전체 보기 ({len(unapproved_master_df)}건 — 미제출 + 대기중 포함)"):
                     st.dataframe(unapproved_master_df[['품목코드', '품목명', '거래처명']], use_container_width=True, hide_index=True)
 
-            # [서브탭 4] 상호 미매칭 제출건 및 타 거래처 코드 오매핑 점검
             with sub_tab4:
                 st.markdown("##### 1) 🚨 타 거래처 코드 오매핑 의심 건 (다른 공급사 제출건에 타사 코드가 부여된 항목)")
-                st.caption("예: 일반 공급사가 제출한 원료에 롯데칠성 전용 품목코드가 잘못 입력된 경우 여기에 표시되며, 원래 거래처(롯데칠성)의 제출 건수로는 카운트되지 않습니다.")
+                st.caption("공급사명과 부여된 마스터 코드의 거래처명이 서로 다른 항목입니다. 원래 거래처의 제출 건수로는 카운트되지 않습니다.")
                 if code_mismatch_df.empty:
                     st.success("✅ 타 거래처 코드로 잘못 매핑된 승인 건이 없습니다.")
                 else:
@@ -1247,9 +1392,9 @@ else:
 
                 st.markdown("---")
                 st.markdown("##### 2) ⚠️ 마스터 거래처명과 상호가 매칭되지 않은 제출건")
-                st.caption("업체가 시트1에 제출했으나 공급사(판매원) 명칭을 마스터 명단과 전혀 다르게 기재하여 자동 연결되지 않은 항목입니다. 독촉 메일 발송 전 확인해 주세요.")
+                st.caption("업체가 시트1에 제출했으나 공급사(판매원) 명칭이 마스터 명단과 연결되지 않은 항목입니다.")
                 if unmatched_sub_df.empty:
-                    st.success("🎉 시트1의 모든 제출건이 마스터 거래처명과 정상 매칭되었습니다.")
+                    st.success("🎉 시트1의 모든 제출건이 마스터 거래처명과 100% 정상 매칭되었습니다.")
                 else:
                     st.warning(f"⚠️ 마스터 거래처명과 상호가 매칭되지 않은 제출건이 {len(unmatched_sub_df)}건 있습니다.")
                     u_cols = [c for c in ['검증상태', '코드', '제품명', '공급사(판매원)', '제조원', '제출일시'] if c in unmatched_sub_df.columns]
