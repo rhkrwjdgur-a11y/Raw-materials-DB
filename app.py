@@ -311,50 +311,202 @@ def load_master_data():
         return pd.DataFrame()
 
 # ==========================================
-# 3. 공용 헬퍼 함수 (상호 정규화 & 마스터 매칭)
+# 3. 공용 헬퍼 함수 (정밀 상호·품목 정규화 & 마스터 매칭)
 # ==========================================
+GENERIC_CORP_SUFFIXES = (
+    "인터내셔널", "인터내셔날", "글로벌", "코리아", "산업", "상사", "통상", "무역",
+    "유통", "물산", "화학", "케미칼", "케미컬", "바이오", "바이오켐", "푸드", "푸드텍",
+    "식품", "향료", "제약", "상회", "농산", "축산", "수산", "에프앤비", "fnb", "food",
+    "foods", "korea", "global", "international"
+)
+
+OEM_NOISE_TOKENS = {
+    "프루티홈", "남양유업", "삼육케어", "한국메디칼푸드", "돌코리아", "비알", "빙그레",
+    "빙그레880", "빙그레캐옴", "넛유", "롯데칠성", "푸르밀", "뉴트리", "태국산", "중국산",
+    "호주산혼합", "소분", "20kg소분", "20kg", "foodgrade", "hy", "tof", "bk"
+}
+
 def normalize_company_name(name, strip_parens=True):
-    """법인 기호, 불필요 수식어, 공백, 괄호 부가정보를 제거하여 핵심 상호명을 추출합니다."""
+    """법인 기호, 수식어, 공백, 괄호 부가정보를 제거하여 핵심 상호명을 추출합니다."""
     if pd.isna(name):
         return ""
     s = str(name).strip()
-    s = re.sub(r'^(공급사|판매원|제조원|납품업체)\s*[:：]\s*', '', s)
-    s = s.replace("㈜", "").replace("(주)", "").replace("（주）", "")
-    s = s.replace("주식회사", "").replace("유한회사", "").replace("(유)", "").replace("합자회사", "").replace("(합)", "")
+    s = re.sub(r'^(공급사|판매원|제조원|납품업체|거래처|상호명?)\s*[:：]\s*', '', s)
+    s = s.replace("㈜", " ").replace("(주)", " ").replace("（주）", " ")
+    s = s.replace("(유)", " ").replace("（유）", " ").replace("(합)", " ")
+    s = re.sub(r'(주식회사|유한회사|유한책임회사|합자회사|합명회사)', ' ', s)
+    s = re.sub(r'\b(co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc|limited|company)\b', ' ', s, flags=re.IGNORECASE)
     if strip_parens:
-        s = re.sub(r'\([^)]*\)', '', s)
-        s = re.sub(r'\[[^\]]*\]', '', s)
+        s = re.sub(r'\([^)]*\)', ' ', s)
+        s = re.sub(r'\[[^\]]*\]', ' ', s)
     s = re.sub(r'[^가-힣a-zA-Z0-9]', '', s).lower()
     return s
 
-def is_same_company(vendor_input, master_vendor):
-    """업체 입력 공급사명과 마스터 거래처명의 일치 여부를 판별합니다."""
-    v_core = normalize_company_name(vendor_input, strip_parens=True)
-    m_core = normalize_company_name(master_vendor, strip_parens=True)
-    v_full = normalize_company_name(vendor_input, strip_parens=False)
-    m_full = normalize_company_name(master_vendor, strip_parens=False)
+def extract_company_variants(raw_name):
+    """업체명에서 본명칭, 괄호 내 약칭, 영문 발음 표기 변형을 추출합니다."""
+    if pd.isna(raw_name) or not str(raw_name).strip():
+        return set()
+    s = str(raw_name).strip()
+    variants = set()
+    c_core = normalize_company_name(s, strip_parens=True)
+    c_full = normalize_company_name(s, strip_parens=False)
+    if c_core:
+        variants.add(c_core)
+    if c_full:
+        variants.add(c_full)
 
-    for a, b in [(v_core, m_core), (v_full, m_full), (v_core, m_full), (v_full, m_core)]:
-        if a and b:
-            if a == b:
-                return True
-            if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
-                return True
+    ignore_tags = {"주", "유", "합", "본사", "공장", "유지", "가공", "탈지", "냉장", "상온", "수입", "직거래", "인천세관장"}
+    for p in re.findall(r'\(([^)]+)\)', s):
+        p_clean = normalize_company_name(p, strip_parens=True)
+        if p_clean and p_clean not in ignore_tags and len(p_clean) >= 2:
+            variants.add(p_clean)
+
+    expanded = set(variants)
+    for v in variants:
+        v_kor = (
+            v.replace("hy", "에이치와이")
+             .replace("fi", "에프아이")
+             .replace("f&f", "에프앤에프")
+             .replace("fnf", "에프앤에프")
+             .replace("tof", "티오에프")
+             .replace("jj", "제이제이")
+             .replace("nnp", "앤앤피")
+             .replace("bk", "비케이")
+             .replace("tr", "티알")
+             .replace("hn", "에이치엔")
+             .replace("csf", "씨에스에프")
+        )
+        expanded.add(v_kor)
+    return expanded
+
+def is_same_company(vendor_input, master_vendor):
+    """공급사(판매원)와 마스터 거래처명을 엄격 대조합니다 (무작위 짧은 단어 포함 오매칭 차단)."""
+    sv_set = extract_company_variants(vendor_input)
+    mv_set = extract_company_variants(master_vendor)
+    if not sv_set or not mv_set:
+        return False
+
+    if sv_set & mv_set:
+        return True
+
+    for sv in sv_set:
+        for mv in mv_set:
+            shorter, longer = (sv, mv) if len(sv) <= len(mv) else (mv, sv)
+            if len(shorter) >= 3 and longer.startswith(shorter):
+                rem = longer[len(shorter):]
+                if rem in GENERIC_CORP_SUFFIXES:
+                    return True
     return False
 
+def normalize_food_item(text):
+    """식품첨가물 이명·영문 약어·발음 표기 차이를 표준화합니다."""
+    s = re.sub(r'\s+', '', str(text).strip().lower())
+    replacements = [
+        ("구연산삼나트륨", "구연산나트륨"),
+        ("구연산소다", "구연산나트륨"),
+        ("카복시메틸셀룰로스나트륨", "cmc"),
+        ("카르복시메틸셀룰로스나트륨", "cmc"),
+        ("카르복시메틸셀룰로오스나트륨", "cmc"),
+        ("sodiumcarboxymethylcellulose", "cmc"),
+        ("carboxymethylcellulose", "cmc"),
+        ("아비셀플러스", "avicel+"),
+        ("아비셀", "avicel"),
+        ("지피", "gp"),
+        ("초코렛", "초코"),
+        ("초콜렛", "초코"),
+        ("초콜릿", "초코"),
+        ("흑임자", "검은깨"),
+        ("검은참깨", "검은깨"),
+        ("정제소금", "정제염"),
+        ("본소금", "정제염"),
+        ("비타민-", "비타민"),
+    ]
+    for k, v in replacements:
+        s = s.replace(k, v)
+    return s
+
 def calc_name_similarity(a, b):
-    """제품명과 마스터 품목명 간의 글자 2-gram 유사도를 계산합니다."""
-    s1 = re.sub(r'[^가-힣a-zA-Z0-9]', '', str(a)).lower()
-    s2 = re.sub(r'[^가-힣a-zA-Z0-9]', '', str(b)).lower()
+    """일반 수식어('농축액', '혼합제제' 등) 착시를 배제한 품목명 유사도를 계산합니다."""
+    s1 = re.sub(r'[^가-힣a-z0-9+#]', '', normalize_food_item(a))
+    s2 = re.sub(r'[^가-힣a-z0-9+#]', '', normalize_food_item(b))
     if not s1 or not s2:
         return 0.0
     if s1 == s2:
         return 1.0
-    score_bonus = 0.4 if (s1 in s2 or s2 in s1) else 0.0
+
+    generic_words = ["혼합제제", "분말", "농축과즙", "농축액", "추출분말", "추출액", "페이스트", "시럽", "향", "과즙"]
+    c1, c2 = s1, s2
+    for gw in generic_words:
+        if len(c1) > len(gw) + 1:
+            c1 = c1.replace(gw, "")
+        if len(c2) > len(gw) + 1:
+            c2 = c2.replace(gw, "")
+
+    if c1 and c2 and c1 == c2:
+        return 0.95
+    if c1 and c2 and len(c1) >= 3 and len(c2) >= 3 and (c1 in c2 or c2 in c1):
+        return 0.85
+
     g1 = {s1[i:i+2] for i in range(max(1, len(s1) - 1))}
     g2 = {s2[i:i+2] for i in range(max(1, len(s2) - 1))}
-    overlap = len(g1 & g2) / max(1, len(g1 | g2))
-    return min(1.0, overlap + score_bonus)
+    base_sim = len(g1 & g2) / max(1, len(g1 | g2))
+
+    if c1 and c2:
+        cg1 = {c1[i:i+2] for i in range(max(1, len(c1) - 1))}
+        cg2 = {c2[i:i+2] for i in range(max(1, len(c2) - 1))}
+        core_sim = len(cg1 & cg2) / max(1, len(cg1 | cg2))
+        return (base_sim * 0.4) + (core_sim * 0.6)
+    return base_sim
+
+def extract_item_segments(name, vendor_name=""):
+    """마스터 품목명의 괄호 밖 본명칭과 괄호 안 세부 모델명(고객사 노이즈 제외)을 분리 추출합니다."""
+    raw = str(name).strip()
+    segs = {normalize_food_item(raw)}
+    outside = re.sub(r'\([^)]*\)', ' ', raw).strip()
+    if outside:
+        segs.add(normalize_food_item(outside))
+
+    v_clean = re.sub(r'[^가-힣a-z0-9]', '', normalize_food_item(vendor_name))
+    for grp in re.findall(r'\(([^)]+)\)', raw):
+        for part in re.split(r'[,/]', grp):
+            p_norm = normalize_food_item(part)
+            p_alnum = re.sub(r'[^가-힣a-z0-9+#]', '', p_norm)
+            if not p_alnum or len(p_alnum) < 2:
+                continue
+            if p_alnum in OEM_NOISE_TOKENS or (v_clean and p_alnum == v_clean):
+                continue
+            segs.add(p_norm)
+    return {re.sub(r'[^가-힣a-z0-9+#]', '', x) for x in segs if re.sub(r'[^가-힣a-z0-9+#]', '', x)}
+
+def smart_item_match_score(sub_name, master_name, vendor_name=""):
+    """동일 거래처 내에서 업체 제출 제품명과 마스터 품목명의 정밀 일치 점수를 반환합니다."""
+    sub_segs = extract_item_segments(sub_name, vendor_name)
+    mst_segs = extract_item_segments(master_name, vendor_name)
+    if not sub_segs or not mst_segs:
+        return 0.0
+
+    if sub_segs & mst_segs:
+        return 1.0
+
+    sub_full = normalize_food_item(sub_name)
+    mst_full = normalize_food_item(master_name)
+    model_mst = set(re.findall(r'(?:#\d+|[a-z]+\+?\d+[a-z0-9]*|\d{4,})', mst_full))
+    model_sub = set(re.findall(r'(?:#\d+|[a-z]+\+?\d+[a-z0-9]*|\d{4,})', sub_full))
+    common_models = {m for m in (model_mst & model_sub) if m not in {"100", "2000"}}
+    if common_models:
+        return 0.95
+
+    generic_only = {"혼합제제", "농축액", "과즙농축액", "페이스트", "추출분말", "추출액", "분말", "시럽"}
+    best = 0.0
+    for ss in sub_segs:
+        for ms in mst_segs:
+            if len(ss) >= 3 and len(ms) >= 3 and (ss in ms or ms in ss):
+                if ss not in generic_only and ms not in generic_only:
+                    best = max(best, 0.88)
+            sim = calc_name_similarity(ss, ms)
+            if sim > best:
+                best = sim
+    return best
 
 def filter_master_candidates(master_df, vendor_name, product_name):
     """전체 원재료 명단에서 1순위(동일 공급사 납품 품목) 및 2순위(품목명 유사 품목) 후보군을 압축 추출합니다."""
@@ -365,12 +517,14 @@ def filter_master_candidates(master_df, vendor_name, product_name):
     work_df['품목코드'] = work_df['품목코드'].astype(str).str.strip()
     work_df = work_df[work_df['품목코드'] != '']
 
-    # 1차: 공급사(판매원) ↔ 거래처명 매칭
+    # 1차: 공급사(판매원) ↔ 거래처명 엄격 매칭
     vendor_mask = work_df['거래처명'].apply(lambda mv: is_same_company(vendor_name, mv))
     vendor_matched_df = work_df[vendor_mask].drop_duplicates()
 
-    # 2차: 품목명 유사도 상위 후보 추출 (공급사 오기재 대비용)
-    work_df['_sim'] = work_df['품목명'].apply(lambda mp: calc_name_similarity(product_name, mp))
+    # 2차: 품목명 정밀 유사도 상위 후보 추출 (공급사 오기재 대비용)
+    work_df['_sim'] = work_df.apply(
+        lambda r: smart_item_match_score(product_name, r['품목명'], r['거래처명']), axis=1
+    )
     sim_limit = 15 if not vendor_matched_df.empty else 40
     similar_df = work_df[~vendor_mask].sort_values(by='_sim', ascending=False).head(sim_limit)
     similar_df = similar_df[similar_df['_sim'] > 0][['품목코드', '품목명', '거래처명']].drop_duplicates()
@@ -406,15 +560,15 @@ def verify_with_ai(file_bytes, mime_type, vendor_data, candidates_payload):
 
     [작업 2: 사내 원자재 마스터 품목코드 자동 매칭]
     아래 제공된 '사내 원자재 후보 명단(JSON)'에서 업체가 제출한 [공급사(판매원): {vendor_data.get('공급사(판매원)', '')}] 및 [제품명: {vendor_data['제품명']}]과 일치하는 품목을 찾아 `품목코드`를 매칭하세요.
-    - 1순위 원칙: `공급사_일치_품목` 리스트(해당 거래처가 당사에 납품하는 품목 목록) 안에서 제품명·원재료 성분·이명(예: 구연산삼나트륨=구연산나트륨, 한주 본소금/중국산 정제염=정제염, 사내 괄호 구분자 제외 명칭 등)이 일치하는 품목코드를 최우선 선택하세요.
-    - 2순위 원칙: `공급사_일치_품목`이 비어 있거나 일치 품목이 전혀 없을 때만 `품목명_유사_참고후보`에서 제조원·제품명이 확실히 일치하는 코드를 선택하세요.
+    - 1순위 원칙: `공급사_일치_품목` 리스트(해당 거래처가 당사에 납품하는 품목 목록) 안에서 제품명·모델번호·이명(예: 구연산삼나트륨=구연산나트륨, CMC=카복시메틸셀룰로스나트륨, Avicel=아비셀 등)이 일치하는 품목코드를 최우선 선택하세요.
+    - 2순위 원칙: `공급사_일치_품목`에 해당 품목이 없을 때만 `품목명_유사_참고후보`를 확인하되, 거래처명이 전혀 다른 타사 OEM 전용 품목(예: 공급사가 롯데칠성이 아닌데 거래처가 롯데칠성인 코드 등)은 절대 추천하지 말고 불확실하면 '없음'으로 기재하세요.
     - 사내 원자재 후보 명단(JSON): {candidates_json}
 
     [출력 형식] (반드시 아래 양식을 지켜 순수 텍스트로만 출력하세요)
     판정: [합격] 또는 [불합격] (사유: ~)
     상세코멘트: (라벨 대조 및 알레르기 검증 결과 상세 작성)
     매칭근거: (선택한 사내 품목명·거래처명 및 매칭 판단 근거 요약)
-    추천매칭코드: (찾아낸 품목코드만 정확히 기재. 명단에 없거나 불확실하면 '없음'으로 기재)
+    추천매칭코드: (찾아낸 품목코드만 정확히 기재. 명단에 없거나 거래처가 달라 불확실하면 '없음'으로 기재)
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
