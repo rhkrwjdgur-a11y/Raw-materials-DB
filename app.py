@@ -883,12 +883,12 @@ else:
     df = load_sheet_data()
     master_df = standardize_master_columns(load_master_data())
 
-    # ------------------ [탭 1: 수취 현황판 (미제출 독촉 & 승인 관리 분리)] ------------------
+    # ------------------ [탭 1: 수취 현황판 (정밀 미제출 독촉 & 승인 분리)] ------------------
     with admin_tab1:
         col_t1_title, col_t1_btn = st.columns([8, 2])
         with col_t1_title:
             st.markdown("### 📈 협력업체 라벨 제출 현황 및 승인 관제")
-            st.caption("① 아예 안 낸 업체 명단, ② 낸 업체 중 누락 품목(승인·미승인 무관), ③ 내부 승인/미승인 현황을 각각 분리하여 관리합니다.")
+            st.caption("공급사(판매원) 엄격 매칭 및 이명·모델명 분석을 적용하여 ① 전면 미제출 업체, ② 제출 업체 중 누락 품목(승인·미승인 무관), ③ 승인/미승인 현황을 정확히 분리합니다.")
         with col_t1_btn:
             st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
             if st.button("🔄 최신 데이터 불러오기", key="t1_btn_refresh", use_container_width=True):
@@ -905,7 +905,7 @@ else:
 
             total_items = len(master_view)
 
-            # 시트1 전체 제출 데이터 정리
+            # 시트1 유효 제출 데이터 정리
             valid_sub_df = pd.DataFrame()
             if not df.empty:
                 valid_sub_df = df.copy()
@@ -921,142 +921,80 @@ else:
                 valid_sub_df['코드'] = valid_sub_df['코드'].astype(str).str.strip()
                 valid_sub_df['검증상태'] = valid_sub_df['검증상태'].astype(str).str.strip()
 
-            # 마스터 거래처별 인덱스 구성
-            vendor_meta = {}
+            # 마스터 거래처 목록 및 코드별 거래처 인덱스 구성
+            vendor_items_map = {}
             for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
-                raw_v = grp['거래처명_원본'].iloc[0]
-                vendor_meta[v_disp] = {
-                    'raw': raw_v,
-                    'norm_full': normalize_company_name(raw_v, strip_parens=False),
-                    'norm_core': normalize_company_name(raw_v, strip_parens=True),
-                    'items': grp['품목명'].astype(str).tolist()
-                }
+                vendor_items_map[v_disp] = grp['품목명'].astype(str).tolist()
+
+            all_master_vendors = [k for k in vendor_items_map.keys() if k != "(거래처 미기재)"]
 
             code_to_vendors = {}
+            code_to_names = {}
             for _, r in master_view.iterrows():
                 c_val = r['품목코드']
                 code_to_vendors.setdefault(c_val, []).append(r['거래처_표시명'])
+                code_to_names[c_val] = r['품목명']
             code_to_vendors = {k: list(dict.fromkeys(v)) for k, v in code_to_vendors.items()}
 
-            # 시트1 제출 행 -> 마스터 거래처 1곳 매핑
-            def match_company_to_master_vendor(comp_str, prod_name, candidate_vendors=None):
-                v_full = normalize_company_name(comp_str, strip_parens=False)
-                v_core = normalize_company_name(comp_str, strip_parens=True)
-                if not v_full and not v_core:
-                    return None
-                target_list = candidate_vendors if candidate_vendors is not None else [
-                    k for k in vendor_meta.keys() if k != "(거래처 미기재)"
-                ]
-
-                def pick_best(matches):
-                    if len(matches) == 1:
-                        return matches[0]
-                    best_v, best_sim = matches[0], -1.0
-                    for mv in matches:
-                        sims = [calc_name_similarity(prod_name, it) for it in vendor_meta[mv]['items']]
-                        max_s = max(sims) if sims else 0.0
-                        if max_s > best_sim:
-                            best_sim = max_s
-                            best_v = mv
-                    return best_v
-
-                m1 = [mv for mv in target_list if v_full and vendor_meta[mv]['norm_full'] == v_full]
-                if m1:
-                    return pick_best(m1)
-                m2 = [mv for mv in target_list if v_core and vendor_meta[mv]['norm_core'] == v_core]
-                if m2:
-                    return pick_best(m2)
-                m3 = []
-                for mv in target_list:
-                    mc = vendor_meta[mv]['norm_core']
-                    mf = vendor_meta[mv]['norm_full']
-                    for a, b in [(v_core, mc), (v_full, mf), (v_core, mf), (v_full, mc)]:
-                        if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
-                            m3.append(mv)
-                            break
-                if m3:
-                    return pick_best(m3)
-                return None
-
-            def assign_row_vendor(s_row):
-                s_code = str(s_row.get('코드', '')).strip()
+            # 오직 '공급사(판매원)' 기준으로만 마스터 거래처 매칭 (제조원 오매칭 원천 차단; 공급사 칸이 빈 과거 데이터만 예외 허용)
+            def find_matching_master_vendor(s_row):
                 s_prod = str(s_row.get('제품명', '')).strip()
                 s_vendor = str(s_row.get('공급사(판매원)', '')).strip()
                 s_maker = str(s_row.get('제조원', '')).strip()
+                target_company = s_vendor if s_vendor else s_maker
+                if not target_company:
+                    return None
 
-                if s_code and s_code in code_to_vendors:
-                    c_vendors = code_to_vendors[s_code]
-                    if len(c_vendors) == 1:
-                        return c_vendors[0]
-                    m_c = (
-                        match_company_to_master_vendor(s_vendor, s_prod, c_vendors)
-                        or match_company_to_master_vendor(s_maker, s_prod, c_vendors)
-                    )
-                    if m_c:
-                        return m_c
+                matched_v_list = [mv for mv in all_master_vendors if is_same_company(target_company, mv)]
+                if not matched_v_list:
+                    return None
+                if len(matched_v_list) == 1:
+                    return matched_v_list[0]
 
-                m_v = match_company_to_master_vendor(s_vendor, s_prod)
-                if m_v:
-                    return m_v
-                m_m = match_company_to_master_vendor(s_maker, s_prod)
-                if m_m:
-                    return m_m
-                return None
+                # 동일 법인이 마스터에 '(유지)', '(가공)' 등으로 나뉘어 있을 때 품목명 유사도가 가장 높은 쪽 선택
+                best_mv, best_sc = matched_v_list[0], -1.0
+                for mv in matched_v_list:
+                    scores = [smart_item_match_score(s_prod, it, mv) for it in vendor_items_map[mv]]
+                    max_sc = max(scores) if scores else 0.0
+                    if max_sc > best_sc:
+                        best_sc = max_sc
+                        best_mv = mv
+                return best_mv
 
+            code_mismatch_list = []
             if not valid_sub_df.empty:
-                valid_sub_df['_매칭거래처'] = valid_sub_df.apply(assign_row_vendor, axis=1)
+                valid_sub_df['_매칭거래처'] = valid_sub_df.apply(find_matching_master_vendor, axis=1)
                 unmatched_sub_df = valid_sub_df[valid_sub_df['_매칭거래처'].isna()].copy()
+
+                # 타 거래처 전용 코드가 잘못 부여된 오매핑 행 탐지 (예: 일반 공급사 제출건에 롯데칠성 코드 부여 등)
+                coded_all = valid_sub_df[valid_sub_df['코드'] != '']
+                for _, crow in coded_all.iterrows():
+                    sc = crow['코드']
+                    matched_mv = crow['_매칭거래처']
+                    if sc in code_to_vendors:
+                        valid_owners = code_to_vendors[sc]
+                        if matched_mv not in valid_owners:
+                            code_mismatch_list.append({
+                                '부여된 코드': sc,
+                                '코드의 마스터 품목명': code_to_names.get(sc, ''),
+                                '코드의 마스터 거래처': ", ".join(valid_owners),
+                                '시트1 제출 제품명': crow.get('제품명', ''),
+                                '시트1 제출 공급사(판매원)': crow.get('공급사(판매원)', ''),
+                                '시트1 제출 제조원': crow.get('제조원', '')
+                            })
             else:
                 unmatched_sub_df = pd.DataFrame()
 
-            # 승인 전 대기중 품목의 제품명 <-> 마스터 품목명 대조 점수 함수
-            def normalize_item_text(t):
-                s = str(t).strip().lower()
-                s = s.replace("구연산삼나트륨", "구연산나트륨").replace("흑임자", "검은깨")
-                s = re.sub(r'[^가-힣a-z0-9]', '', s)
-                return s
+            code_mismatch_df = pd.DataFrame(code_mismatch_list)
 
-            def item_pair_score(sub_name, master_name, vendor_name=""):
-                sn = normalize_item_text(sub_name)
-                if not sn:
-                    return 0.0
-                candidates = [master_name]
-                outside = re.sub(r'\([^)]*\)', '', str(master_name)).strip()
-                if outside:
-                    candidates.append(outside)
-                v_norm = normalize_item_text(vendor_name)
-                for m in re.findall(r'\(([^)]+)\)', str(master_name)):
-                    mn = normalize_item_text(m)
-                    if mn and mn != v_norm and len(mn) >= 2:
-                        candidates.append(m)
-
-                best = 0.0
-                for cand in candidates:
-                    cn = normalize_item_text(cand)
-                    if not cn:
-                        continue
-                    if sn == cn:
-                        return 1.0
-                    sim = calc_name_similarity(sn, cn)
-                    if len(sn) >= 2 and len(cn) >= 2 and (sn in cn or cn in sn):
-                        sim = max(sim, 0.75)
-                    if sim > best:
-                        best = sim
-                return best
-
-            # 마스터 품목별 상태 판별: 승인여부(코드 확정) vs 제출여부_통합(승인+대기중 모두 포함)
+            # 마스터 품목별 상태 판별 (오직 공급사가 실제 일치하는 제출건만 해당 거래처 실적으로 인정)
             master_view['승인여부'] = False
             master_view['제출여부_통합'] = False
             master_view['매칭된_제출제품명'] = ""
-            master_view['업체_미분류_대기건'] = ""
+            master_view['미매칭_추가제출_참고'] = ""
 
             zero_vendor_list = []
             submitted_vendor_names = set()
-
-            code_vendor_counts = master_view['품목코드'].value_counts().to_dict()
-            all_approved_codes = set()
-            if not valid_sub_df.empty:
-                all_approved_codes = set(valid_sub_df[valid_sub_df['코드'] != '']['코드'].tolist())
 
             for v_disp, grp in master_view.groupby('거래처_표시명', sort=False):
                 m_indices = grp.index.tolist()
@@ -1065,15 +1003,8 @@ else:
                 else:
                     v_subs = pd.DataFrame()
 
-                # 단일 거래처 코드인데 코드 승인만 되어 있는 건 보완
-                approved_by_single_code_idx = set()
-                for idx in m_indices:
-                    mc = master_view.loc[idx, '품목코드']
-                    if code_vendor_counts.get(mc, 1) == 1 and mc in all_approved_codes:
-                        approved_by_single_code_idx.add(idx)
-
-                if v_subs.empty and not approved_by_single_code_idx:
-                    # 아예 1건도 안 낸 전면 미제출 업체
+                if v_subs.empty:
+                    # 실제 공급사 기준 1건도 제출하지 않은 전면 미제출 업체
                     biz_str = ""
                     if has_biz_col:
                         biz_vals = [str(x).strip() for x in grp['사업자번호'].unique() if str(x).strip()]
@@ -1089,30 +1020,24 @@ else:
 
                 submitted_vendor_names.add(v_disp)
 
-                # 1단계: 코드 승인된 건 매칭
                 used_sub_indices = set()
                 matched_m_indices = set()
 
-                for idx in approved_by_single_code_idx:
-                    master_view.loc[idx, '승인여부'] = True
-                    master_view.loc[idx, '제출여부_통합'] = True
-                    matched_m_indices.add(idx)
+                # 1단계: 해당 거래처 제출건 중 코드 승인 완료건 매칭
+                coded_subs = v_subs[v_subs['코드'] != '']
+                for s_idx, s_row in coded_subs.iterrows():
+                    sc = s_row['코드']
+                    for idx in m_indices:
+                        if master_view.loc[idx, '품목코드'] == sc:
+                            master_view.loc[idx, '승인여부'] = True
+                            master_view.loc[idx, '제출여부_통합'] = True
+                            master_view.loc[idx, '매칭된_제출제품명'] = str(s_row.get('제품명', ''))
+                            matched_m_indices.add(idx)
+                            used_sub_indices.add(s_idx)
 
-                if not v_subs.empty:
-                    coded_subs = v_subs[v_subs['코드'] != '']
-                    for s_idx, s_row in coded_subs.iterrows():
-                        sc = s_row['코드']
-                        for idx in m_indices:
-                            if master_view.loc[idx, '품목코드'] == sc:
-                                master_view.loc[idx, '승인여부'] = True
-                                master_view.loc[idx, '제출여부_통합'] = True
-                                master_view.loc[idx, '매칭된_제출제품명'] = str(s_row.get('제품명', ''))
-                                matched_m_indices.add(idx)
-                                used_sub_indices.add(s_idx)
-
-                # 2단계: 승인 전(코드 빈칸) 대기중 제출건 매칭 (승인·미승인 구분 없이 제출 인정)
+                # 2단계: 미승인 대기건(또는 타코드 부여건)을 정밀 품목명·모델번호·이명 점수로 1:1 매칭
                 rem_m_indices = [idx for idx in m_indices if idx not in matched_m_indices]
-                rem_subs = v_subs[~v_subs.index.isin(used_sub_indices)] if not v_subs.empty else pd.DataFrame()
+                rem_subs = v_subs[~v_subs.index.isin(used_sub_indices)]
 
                 if len(m_indices) == 1 and len(rem_m_indices) == 1 and not rem_subs.empty:
                     only_idx = rem_m_indices[0]
@@ -1127,8 +1052,8 @@ else:
                         m_name = master_view.loc[idx, '품목명']
                         for s_idx, s_row in rem_subs.iterrows():
                             s_name = str(s_row.get('제품명', ''))
-                            sc_val = item_pair_score(s_name, m_name, v_disp)
-                            if sc_val >= 0.55:
+                            sc_val = smart_item_match_score(s_name, m_name, v_disp)
+                            if sc_val >= 0.60:
                                 pair_candidates.append((sc_val, idx, s_idx, s_name))
                     pair_candidates.sort(key=lambda x: x[0], reverse=True)
                     for sc_val, idx, s_idx, s_name in pair_candidates:
@@ -1138,25 +1063,23 @@ else:
                             matched_m_indices.add(idx)
                             used_sub_indices.add(s_idx)
 
-                # 해당 업체에 제품명이 마스터와 전혀 달라 자동 연결 안 된 대기건이 남았다면 비고 표시
-                leftover_subs = v_subs[~v_subs.index.isin(used_sub_indices)] if not v_subs.empty else pd.DataFrame()
+                # 해당 업체가 제출한 다른 미매칭 건이 남아 있을 때만 참고 표시
+                leftover_subs = v_subs[~v_subs.index.isin(used_sub_indices)]
                 if not leftover_subs.empty:
                     leftover_names = ", ".join(leftover_subs['제품명'].astype(str).tolist())
                     for idx in m_indices:
                         if not master_view.loc[idx, '제출여부_통합']:
-                            master_view.loc[idx, '업체_미분류_대기건'] = f"대기중 타명칭 제출있음: {leftover_names}"
+                            master_view.loc[idx, '미매칭_추가제출_참고'] = f"동일업체 타명칭 제출건 확인필요: {leftover_names}"
 
-            # 결과 데이터프레임 분리
+            # 결과 데이터프레임 구성
             zero_vendors_df = pd.DataFrame(zero_vendor_list)
 
-            # [그룹 2] 1건 이상 제출한 업체 중, 승인·미승인 구분 없이 아직 안 들어온 누락 품목 리스트
             partial_missing_items_df = master_view[
                 (master_view['거래처_표시명'].isin(submitted_vendor_names)) &
                 (master_view['제출여부_통합'] == False)
             ].copy()
             partial_missing_items_df['거래처명'] = partial_missing_items_df['거래처_표시명']
 
-            # [그룹 3] 내부 검수 관리용 (승인 vs 미승인)
             approved_master_df = master_view[master_view['승인여부'] == True].copy()
             unapproved_master_df = master_view[master_view['승인여부'] == False].copy()
             pending_sheet_df = valid_sub_df[valid_sub_df['검증상태'] == '대기중'].copy() if not valid_sub_df.empty else pd.DataFrame()
@@ -1165,8 +1088,9 @@ else:
             total_approved_master_cnt = len(approved_master_df)
             submit_rate_pct = round((total_submitted_master_cnt / total_items) * 100, 1) if total_items > 0 else 0.0
             approve_rate_pct = round((total_approved_master_cnt / total_items) * 100, 1) if total_items > 0 else 0.0
+            check_needed_cnt = len(unmatched_sub_df) + len(code_mismatch_df)
 
-            # 상단 요약 지표 (독촉 관점 + 승인 관점 분리 표시)
+            # 상단 요약 KPI
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("🔴 아예 안 낸 업체 (0건 제출)", f"{len(zero_vendors_df)}개사")
             k2.metric("🟡 낸 업체의 누락 품목 (승인·미승인 무관)", f"{len(partial_missing_items_df)}건", f"{partial_missing_items_df['거래처명'].nunique() if not partial_missing_items_df.empty else 0}개사")
@@ -1175,23 +1099,22 @@ else:
 
             st.progress(min(1.0, submit_rate_pct / 100.0))
             st.markdown(
-                f"**[제출 기준(승인·미승인 합산)] 전체 {total_items}건 중 {total_submitted_master_cnt}건 접수 ({submit_rate_pct}%)** "
+                f"**[제출 기준(승인·미승인 합산)] 전체 {total_items}건 중 {total_submitted_master_cnt}건 접수 확인 ({submit_rate_pct}%)** "
                 f"&nbsp;|&nbsp; **[승인 기준] {total_approved_master_cnt}건 코드 확정 ({approve_rate_pct}%)**"
             )
 
             st.markdown("---")
 
-            # 목적별로 완전히 분리된 4개 서브탭
             sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
                 f"🔴 1. 아예 안 낸 업체 명단 ({len(zero_vendors_df)}개사)",
                 f"🟡 2. 낸 업체 중 누락 품목 ({len(partial_missing_items_df)}건)",
                 f"⚖️ 3. 승인 / 미승인 검수 현황 (대기 {len(pending_sheet_df)}건 · 승인 {total_approved_master_cnt}건)",
-                f"⚠️ 4. 상호 미매칭 제출건 확인 ({len(unmatched_sub_df)}건)"
+                f"⚠️ 4. 상호 미매칭 / 코드 오매핑 점검 ({check_needed_cnt}건)"
             ])
 
             # [서브탭 1] 아예 1건도 제출하지 않은 업체 명단
             with sub_tab1:
-                st.caption("승인·미승인 구분 없이 '시트1'에 단 1건도 제출하지 않은 업체 명단입니다.")
+                st.caption("공급사(판매원) 기준으로 '시트1'에 단 1건도 제출하지 않은 업체 명단입니다. (타 업체 코드 오매핑 건은 제외되어 정확히 집계됨)")
                 if zero_vendors_df.empty:
                     st.success("🎉 전면 미제출 업체가 없습니다!")
                 else:
@@ -1237,9 +1160,9 @@ else:
                             key="t1_dl_zero_items"
                         )
 
-            # [서브탭 2] 낸 업체 중 누락된 품목과 거래처명 (승인·미승인 무관)
+            # [서브탭 2] 낸 업체 중 누락된 품목과 거래처명
             with sub_tab2:
-                st.caption("1건 이상 제출한 업체들 중에서, 이미 제출된 품목(승인완료 + 미승인 대기중 모두 포함)을 제외하고 아직 빠진 '누락 품목'과 '거래처명' 리스트입니다.")
+                st.caption("실제 1건 이상 제출한 공급사들 중에서, 이미 제출된 품목(승인완료 + 미승인 대기중 이명·모델명 일치건 모두 포함)을 제외하고 아직 안 들어온 누락 품목과 거래처명입니다.")
                 if partial_missing_items_df.empty:
                     st.success("🎉 제출 업체 중 누락된 품목이 없습니다!")
                 else:
@@ -1256,8 +1179,8 @@ else:
                     part_item_cols = ['품목코드', '품목명', '거래처명']
                     if has_biz_col:
                         part_item_cols.append('사업자번호')
-                    if (view_part_items['업체_미분류_대기건'] != "").any():
-                        part_item_cols.append('업체_미분류_대기건')
+                    if (view_part_items['미매칭_추가제출_참고'] != "").any():
+                        part_item_cols.append('미매칭_추가제출_참고')
 
                     st.dataframe(
                         view_part_items[part_item_cols].sort_values(by=['거래처명', '품목코드']),
@@ -1273,7 +1196,7 @@ else:
                         key="t1_dl_part_items"
                     )
 
-                    st.markdown("#### 🔎 특정 거래처 선택 시 [누락 품목 vs 실제 제출 내역(승인+대기)] 비교")
+                    st.markdown("#### 🔎 특정 거래처 선택 시 [누락 품목 vs 시트1 실제 제출 내역] 1:1 확인")
                     part_vendor_opts = sorted(view_part_items['거래처명'].unique().tolist())
                     sel_v = st.selectbox(
                         "확인할 거래처를 선택하세요:",
@@ -1284,7 +1207,7 @@ else:
                         cd1, cd2 = st.columns(2)
                         with cd1:
                             v_miss = view_part_items[view_part_items['거래처명'] == sel_v][['품목코드', '품목명']]
-                            st.error(f"🔴 [{sel_v}] 누락 품목 ({len(v_miss)}건)")
+                            st.error(f"🔴 [{sel_v}] 미제출 누락 품목 ({len(v_miss)}건)")
                             st.dataframe(v_miss, use_container_width=True, hide_index=True)
                         with cd2:
                             v_sub_list = valid_sub_df[valid_sub_df['_매칭거래처'] == sel_v] if not valid_sub_df.empty else pd.DataFrame()
@@ -1295,7 +1218,7 @@ else:
 
             # [서브탭 3] 내부 검수 관리: 승인 vs 미승인 별도 관리
             with sub_tab3:
-                st.caption("독촉 명단과 별개로, 우리 팀 내부 검수 기준인 '미승인(검수 대기)' 건과 '승인 완료(마스터 코드 확정)' 건을 따로 관리합니다.")
+                st.caption("독촉 명단과 별개로, 내부 품질검수 기준인 '미승인(검수 대기)' 건과 '승인 완료(거래처·코드 정상 확정)' 건을 따로 관리합니다.")
                 col_a1, col_a2 = st.columns(2)
                 with col_a1:
                     st.warning(f"🔵 시트1 미승인(검수 대기중) 제출 목록 ({len(pending_sheet_df)}건)")
@@ -1312,9 +1235,19 @@ else:
                 with st.expander(f"📋 마스터 전체 기준 미승인 품목 전체 보기 ({len(unapproved_master_df)}건 — 미제출 + 대기중 포함)"):
                     st.dataframe(unapproved_master_df[['품목코드', '품목명', '거래처명']], use_container_width=True, hide_index=True)
 
-            # [서브탭 4] 상호 표기 불일치 제출건 확인 (독촉 오발송 방지)
+            # [서브탭 4] 상호 미매칭 제출건 및 타 거래처 코드 오매핑 점검
             with sub_tab4:
-                st.caption("업체가 시트1에 제출했으나 공급사(판매원)·제조원 명칭을 마스터 거래처명과 다르게 적어 자동 연결되지 않은 건입니다. 독촉 메일 발송 전 한번 확인해 주세요.")
+                st.markdown("##### 1) 🚨 타 거래처 코드 오매핑 의심 건 (다른 공급사 제출건에 타사 코드가 부여된 항목)")
+                st.caption("예: 일반 공급사가 제출한 원료에 롯데칠성 전용 품목코드가 잘못 입력된 경우 여기에 표시되며, 원래 거래처(롯데칠성)의 제출 건수로는 카운트되지 않습니다.")
+                if code_mismatch_df.empty:
+                    st.success("✅ 타 거래처 코드로 잘못 매핑된 승인 건이 없습니다.")
+                else:
+                    st.error(f"🚨 공급사명과 부여된 마스터 코드의 거래처명이 다른 항목이 {len(code_mismatch_df)}건 발견되었습니다. (구글 시트 A열 코드 확인 권장)")
+                    st.dataframe(code_mismatch_df, use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                st.markdown("##### 2) ⚠️ 마스터 거래처명과 상호가 매칭되지 않은 제출건")
+                st.caption("업체가 시트1에 제출했으나 공급사(판매원) 명칭을 마스터 명단과 전혀 다르게 기재하여 자동 연결되지 않은 항목입니다. 독촉 메일 발송 전 확인해 주세요.")
                 if unmatched_sub_df.empty:
                     st.success("🎉 시트1의 모든 제출건이 마스터 거래처명과 정상 매칭되었습니다.")
                 else:
